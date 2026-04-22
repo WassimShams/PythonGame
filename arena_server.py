@@ -17,10 +17,10 @@ import sys
 # ──────────────────────────────────────────────
 #  GAME CONSTANTS
 # ──────────────────────────────────────────────
-GRID_W        = 30          # Grid width  (cells)
-GRID_H        = 20          # Grid height (cells)
+GRID_W        = 36          # Grid width  (cells)
+GRID_H        = 24          # Grid height (cells)
 GAME_DURATION = 120         # Seconds per match
-TICK_RATE     = 10          # Server game-loop ticks per second
+TICK_RATE     = 9           # Server game-loop ticks per second
 INITIAL_HP    = 100         # Starting health
 MAX_HP        = 200         # Health cap
 MAX_PIES      = 7           # Max pies on board at once
@@ -74,12 +74,12 @@ class Snake:
         if d in self.DELTAS and d != self.OPPOSITES.get(self.direction):
             self.next_dir = d
 
-    def step(self):
-        """Advance one tick. Returns new head position."""
+    def step(self, grid_w, grid_h):
+        """Advance one tick with wrap-around. Returns new head position."""
         self.direction = self.next_dir
         dx, dy = self.DELTAS[self.direction]
         hx, hy = self.body[0]
-        new_head = (hx + dx, hy + dy)
+        new_head = ((hx + dx) % grid_w, (hy + dy) % grid_h)
         self.body.insert(0, new_head)
         if self.grow:
             self.grow = False         # keep tail (snake grew)
@@ -205,7 +205,7 @@ class GameSession:
         # Move alive snakes
         for pid, snake in self.snakes.items():
             if snake.alive:
-                snake.step()
+                snake.step(GRID_W, GRID_H)
 
         # Snapshot all occupied body cells
         all_bodies = {pid: set(map(tuple, s.body)) for pid, s in self.snakes.items()}
@@ -214,12 +214,6 @@ class GameSession:
             if not snake.alive:
                 continue
             head = tuple(snake.body[0])
-
-            # ── Wall collision ────────────────
-            if not (0 <= head[0] < GRID_W and 0 <= head[1] < GRID_H):
-                self._apply_damage(pid, 30)
-                snake.body[0] = snake.body[1]   # bounce regardless of shield
-                continue
 
             # ── Obstacle collision ────────────
             if head in self.obstacles:
@@ -555,7 +549,7 @@ class Server:
                         if game:
                             game.send_all({
                                 "type": "game_chat",
-                                "from": f"👀 {username}",
+                                "from": f"Spectator {username}",
                                 "msg":  msg.get("msg", ""),
                             })
 
@@ -579,7 +573,7 @@ class Server:
                                 d.update(state="lobby", game=None, player_id=None)
                                 send_msg(d["conn"], {
                                     "type": "error",
-                                    "msg":  f"{username} disconnected — game cancelled."
+                                    "msg":  f"{username} disconnected - game cancelled."
                                 })
 
                 self._broadcast_lobby()
