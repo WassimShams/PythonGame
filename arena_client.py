@@ -11,6 +11,7 @@ import threading
 import json
 import queue
 import sys
+import math
 
 # ──────────────────────────────────────────────
 #  DISPLAY CONSTANTS  (override if server sends different grid)
@@ -42,6 +43,7 @@ BASE_GAME_W = GRID_W * CELL + PANEL_W
 BASE_GAME_H = GRID_H * CELL
 WINDOW_W    = max(LOBBY_W, BASE_GAME_W)
 WINDOW_H    = max(LOBBY_H, BASE_GAME_H)
+RESERVED_BIND_KEYS = {pygame.K_t, pygame.K_RETURN, pygame.K_ESCAPE}
 
 # ──────────────────────────────────────────────
 #  COLOUR PALETTE
@@ -331,10 +333,12 @@ class ArenaClient:
         self.lobby_viewing    = []        # usernames currently spectating any game
         self.pending_from     = None      # challenger username
         self.game_state       = None      # latest game_state dict from server
+        self.prev_game_state  = None
         self.game_over_data   = None
         self.chat_log         = []        # list of strings
         self.error_msg        = ""
         self.error_timer      = 0
+        self.board_animations = []
 
         # Customization
         self.custom_color    = [0, 210, 90]   # chosen snake color (RGB list)
@@ -366,6 +370,228 @@ class ArenaClient:
     def _apply_window_size(self):
         self.screen = pygame.display.set_mode(self._target_window_size())
 
+    def _draw_poison_skull(self, center, radius):
+        pulse = 1.0 + 0.08 * math.sin(pygame.time.get_ticks() / 180.0)
+        skull_r = max(6, int(radius * pulse))
+        jaw_h = max(4, skull_r // 2)
+        jaw_w = max(8, skull_r + 4)
+
+        glow = pygame.Surface((skull_r * 4, skull_r * 4), pygame.SRCALPHA)
+        pygame.draw.circle(glow, (220, 70, 150, 55), (glow.get_width() // 2, glow.get_height() // 2),
+                           skull_r + 6)
+        self.screen.blit(glow, glow.get_rect(center=center))
+
+        pygame.draw.circle(self.screen, (245, 245, 245), center, skull_r)
+        jaw = pygame.Rect(0, 0, jaw_w, jaw_h)
+        jaw.midtop = (center[0], center[1] + skull_r - jaw_h // 3)
+        pygame.draw.rect(self.screen, (245, 245, 245), jaw, border_radius=3)
+
+        eye_dx = max(3, skull_r // 2 - 1)
+        eye_y = center[1] - max(1, skull_r // 4)
+        pygame.draw.circle(self.screen, C["black"], (center[0] - eye_dx, eye_y), max(2, skull_r // 4))
+        pygame.draw.circle(self.screen, C["black"], (center[0] + eye_dx, eye_y), max(2, skull_r // 4))
+        nose = [(center[0], center[1] + 1),
+                (center[0] - 3, center[1] + 6),
+                (center[0] + 3, center[1] + 6)]
+        pygame.draw.polygon(self.screen, C["black"], nose)
+
+        tooth_w = max(2, jaw_w // 5)
+        tooth_h = max(3, jaw_h - 1)
+        for idx in range(4):
+            tooth = pygame.Rect(jaw.x + 2 + idx * tooth_w, jaw.y + 1, max(1, tooth_w - 1), tooth_h)
+            pygame.draw.rect(self.screen, C["black"], tooth, 1)
+
+        pygame.draw.circle(self.screen, (120, 0, 40), center, skull_r, 1)
+
+    def _draw_shield_pickup(self, center, radius, color):
+        bob = math.sin(pygame.time.get_ticks() / 240.0)
+        cy = center[1] + int(bob * 2)
+        outline = [
+            (center[0], cy - radius),
+            (center[0] + radius - 2, cy - radius // 2),
+            (center[0] + radius - 4, cy + radius // 3),
+            (center[0], cy + radius),
+            (center[0] - radius + 4, cy + radius // 3),
+            (center[0] - radius + 2, cy - radius // 2),
+        ]
+        glow = pygame.Surface((radius * 4, radius * 4), pygame.SRCALPHA)
+        pygame.draw.circle(glow, (*color, 60), (glow.get_width() // 2, glow.get_height() // 2), radius + 8)
+        self.screen.blit(glow, glow.get_rect(center=(center[0], cy)))
+        pygame.draw.polygon(self.screen, color, outline)
+        pygame.draw.polygon(self.screen, C["white"], outline, 2)
+        inner = [
+            (center[0], cy - radius + 4),
+            (center[0] + radius - 6, cy - radius // 2),
+            (center[0] + radius - 8, cy + radius // 4),
+            (center[0], cy + radius - 5),
+            (center[0] - radius + 8, cy + radius // 4),
+            (center[0] - radius + 6, cy - radius // 2),
+        ]
+        pygame.draw.polygon(self.screen, (235, 240, 255), inner)
+        pygame.draw.line(self.screen, color, (center[0], cy - radius + 5), (center[0], cy + radius - 6), 2)
+
+    def _draw_freeze_pickup(self, center, radius, color):
+        angle = pygame.time.get_ticks() / 500.0
+        for axis in range(3):
+            rot = angle + axis * (math.pi / 3)
+            dx = math.cos(rot) * radius
+            dy = math.sin(rot) * radius
+            pygame.draw.line(self.screen, color,
+                             (center[0] - dx, center[1] - dy),
+                             (center[0] + dx, center[1] + dy), 2)
+            tip_x = center[0] + dx
+            tip_y = center[1] + dy
+            branch_dx = math.cos(rot + math.pi / 6) * (radius * 0.35)
+            branch_dy = math.sin(rot + math.pi / 6) * (radius * 0.35)
+            pygame.draw.line(self.screen, color, (tip_x, tip_y),
+                             (tip_x - branch_dx, tip_y - branch_dy), 2)
+            pygame.draw.line(self.screen, color, (tip_x, tip_y),
+                             (tip_x - branch_dy, tip_y + branch_dx), 2)
+        pygame.draw.circle(self.screen, C["white"], center, max(2, radius // 4))
+
+    def _draw_shield_ring(self, snake):
+        if not snake.get("body"):
+            return
+        hx, hy = snake["body"][0]
+        center = (hx * CELL + CELL // 2, hy * CELL + CELL // 2)
+        center = (self._board_x + center[0], self._board_y + center[1])
+        phase = pygame.time.get_ticks() / 170.0
+        base_r = CELL // 2 + 5
+        for idx, alpha in enumerate((120, 55)):
+            ring = pygame.Surface((base_r * 4, base_r * 4), pygame.SRCALPHA)
+            radius = base_r + idx * 4 + int(2 * math.sin(phase + idx))
+            pygame.draw.circle(ring, (190, 210, 255, alpha),
+                               (ring.get_width() // 2, ring.get_height() // 2), radius, 3)
+            self.screen.blit(ring, ring.get_rect(center=center))
+
+    def _draw_freeze_overlay(self, snake):
+        shimmer = pygame.time.get_ticks() / 140.0
+        for idx, (bx, by) in enumerate(snake.get("body", [])):
+            rect = pygame.Rect(self._board_x + bx * CELL + 1, self._board_y + by * CELL + 1,
+                               CELL - 2, CELL - 2)
+            frost = pygame.Surface(rect.size, pygame.SRCALPHA)
+            alpha = 55 if idx else 85
+            frost.fill((170, 235, 255, alpha))
+            self.screen.blit(frost, rect.topleft)
+            if idx == 0:
+                center = rect.center
+                for branch in range(4):
+                    rot = shimmer + branch * (math.pi / 2)
+                    dx = math.cos(rot) * (CELL // 2 + 2)
+                    dy = math.sin(rot) * (CELL // 2 + 2)
+                    pygame.draw.line(self.screen, (210, 250, 255),
+                                     (center[0] - dx, center[1] - dy),
+                                     (center[0] + dx, center[1] + dy), 2)
+                pygame.draw.circle(self.screen, (235, 250, 255), center, CELL // 2 + 3, 1)
+
+    def _grid_to_screen(self, cell_pos):
+        return (
+            self._board_x + cell_pos[0] * CELL + CELL // 2,
+            self._board_y + cell_pos[1] * CELL + CELL // 2,
+        )
+
+    def _spawn_board_animation(self, kind, cell_pos, color=None, duration=420):
+        self.board_animations.append({
+            "kind": kind,
+            "cell": tuple(cell_pos),
+            "color": color,
+            "start": pygame.time.get_ticks(),
+            "duration": duration,
+        })
+
+    def _maybe_trigger_board_animations(self, new_state):
+        prev_state = self.prev_game_state
+        self.prev_game_state = new_state
+        if not prev_state:
+            return
+
+        prev_snakes = prev_state.get("snakes", {})
+        new_snakes = new_state.get("snakes", {})
+        prev_effects = prev_state.get("effects", {})
+        new_effects = new_state.get("effects", {})
+        prev_pies = {
+            tuple(pie["pos"]): pie.get("kind")
+            for pie in prev_state.get("pies", [])
+        }
+        new_pies = {tuple(pie["pos"]) for pie in new_state.get("pies", [])}
+
+        for pid_s, snake in new_snakes.items():
+            body = snake.get("body", [])
+            if not body:
+                continue
+            head = tuple(body[0])
+            prev_snake = prev_snakes.get(pid_s, {})
+            prev_color = tuple(prev_snake.get("color", snake.get("color", [200, 200, 200])))
+            prev_head = tuple(prev_snake.get("body", [head])[0]) if prev_snake.get("body") else head
+
+            if prev_pies.get(head) == "poison" and head not in new_pies:
+                self._spawn_board_animation("poison_flash", head, C["pie_poison"], 360)
+
+            old_fx = set(prev_effects.get(pid_s, []))
+            new_fx = set(new_effects.get(pid_s, []))
+
+            if "shield" in old_fx and "shield" not in new_fx:
+                self._spawn_board_animation("shield_break", prev_head, prev_color, 420)
+            if "freeze" in old_fx and "freeze" not in new_fx:
+                self._spawn_board_animation("freeze_shatter", head, (180, 235, 255), 460)
+
+    def _draw_board_animations(self):
+        now = pygame.time.get_ticks()
+        active = []
+        for anim in self.board_animations:
+            elapsed = now - anim["start"]
+            if elapsed >= anim["duration"]:
+                continue
+            active.append(anim)
+
+            progress = elapsed / anim["duration"]
+            cx, cy = self._grid_to_screen(anim["cell"])
+            color = anim["color"] or C["white"]
+
+            if anim["kind"] == "poison_flash":
+                radius = int(CELL * (0.55 + progress * 0.9))
+                alpha = max(0, int(150 * (1.0 - progress)))
+                burst = pygame.Surface((radius * 4, radius * 4), pygame.SRCALPHA)
+                pygame.draw.circle(burst, (*C["pie_poison"], alpha),
+                                   (burst.get_width() // 2, burst.get_height() // 2), radius)
+                pygame.draw.circle(burst, (255, 255, 255, max(0, alpha - 40)),
+                                   (burst.get_width() // 2, burst.get_height() // 2), max(4, radius // 2), 2)
+                self.screen.blit(burst, burst.get_rect(center=(cx, cy)))
+            elif anim["kind"] == "shield_break":
+                shards = 6
+                for shard in range(shards):
+                    angle = progress * 2.0 + shard * (math.tau / shards)
+                    dist = CELL * (0.15 + progress * 0.7)
+                    sx = cx + math.cos(angle) * dist
+                    sy = cy + math.sin(angle) * dist
+                    ex = sx + math.cos(angle) * 8
+                    ey = sy + math.sin(angle) * 8
+                    pygame.draw.line(self.screen, color, (sx, sy), (ex, ey), 2)
+                ring_alpha = max(0, int(180 * (1.0 - progress)))
+                ring = pygame.Surface((CELL * 5, CELL * 5), pygame.SRCALPHA)
+                pygame.draw.circle(ring, (*color, ring_alpha),
+                                   (ring.get_width() // 2, ring.get_height() // 2),
+                                   int(CELL * (0.65 + progress * 0.5)), 3)
+                self.screen.blit(ring, ring.get_rect(center=(cx, cy)))
+            elif anim["kind"] == "freeze_shatter":
+                shards = 8
+                for shard in range(shards):
+                    angle = shard * (math.tau / shards) + progress * 0.35
+                    dist = CELL * progress * 0.9
+                    sx = cx + math.cos(angle) * dist
+                    sy = cy + math.sin(angle) * dist
+                    ex = sx + math.cos(angle) * (6 + shard % 3)
+                    ey = sy + math.sin(angle) * (6 + shard % 3)
+                    pygame.draw.line(self.screen, color, (sx, sy), (ex, ey), 2)
+                crack_alpha = max(0, int(170 * (1.0 - progress)))
+                aura = pygame.Surface((CELL * 5, CELL * 5), pygame.SRCALPHA)
+                pygame.draw.circle(aura, (*color, crack_alpha // 2),
+                                   (aura.get_width() // 2, aura.get_height() // 2),
+                                   int(CELL * (0.5 + progress * 0.55)), 2)
+                self.screen.blit(aura, aura.get_rect(center=(cx, cy)))
+
+        self.board_animations = active
+
     # ── Build UI elements ─────────────────────
     def _build_connect_ui(self):
         cx = LOBBY_W // 2
@@ -383,14 +609,73 @@ class ArenaClient:
         self.join_btn   = Button  ((cx-110, 392, 220, 52), "Enter the Arena", self.f_md)
         self.name_input.activate()
 
-    # ── Networking ────────────────────────────
-    def _send(self, msg: dict):
-        if self.conn:
+    def _drop_widget(self, name):
+        self.__dict__.pop(name, None)
+
+    def _close_connection(self):
+        conn = self.conn
+        self.conn = None
+        if conn:
             try:
-                with self.send_lock:
-                    self.conn.sendall((json.dumps(msg) + "\n").encode())
+                conn.close()
             except Exception:
                 pass
+
+    def _clear_game_context(self):
+        self.player_id = None
+        self.game_id = None
+        self.watching_game_id = None
+        self.opponent = ""
+        self.prev_game_state = None
+        self.game_state = None
+        self.game_over_data = None
+        self.chat_log = []
+        self.pending_from = None
+        self.customize_ready = False
+        self.binding_slot = None
+        self.custom_color = [0, 210, 90]
+        self.gw = GRID_W
+        self.gh = GRID_H
+        self.board_animations = []
+        self._drop_widget("_game_chat_input")
+
+    def _enter_lobby(self, msg=""):
+        self._clear_game_context()
+        self.state = "LOBBY"
+        self._apply_window_size()
+        if msg:
+            self._set_error(msg)
+
+    def _reset_to_connect(self, msg="Disconnected from server."):
+        ip_text = self.ip_input.text if hasattr(self, "ip_input") else ""
+        port_text = self.port_input.text if hasattr(self, "port_input") else "8000"
+        self._close_connection()
+        self.mq = queue.Queue()
+        self.state = "CONNECT"
+        self.username = ""
+        self.lobby_players = []
+        self.lobby_games = []
+        self.lobby_viewing = []
+        self._clear_game_context()
+        self._drop_widget("_lobby_chat_input")
+        self._build_connect_ui()
+        self.ip_input.set_text(ip_text)
+        self.port_input.set_text(port_text or "8000")
+        self._apply_window_size()
+        if msg:
+            self._set_error(msg)
+
+    # ── Networking ────────────────────────────
+    def _send(self, msg: dict):
+        if not self.conn:
+            return False
+        try:
+            with self.send_lock:
+                self.conn.sendall((json.dumps(msg) + "\n").encode())
+            return True
+        except Exception:
+            self.mq.put({"type": "_disconnected"})
+            return False
 
     def _net_thread(self):
         buf = ""
@@ -406,7 +691,7 @@ class ArenaClient:
                     try:
                         self.mq.put(json.loads(line))
                     except Exception:
-                        pass
+                        self.mq.put({"type": "error", "msg": "Received malformed data from server."})
             except Exception:
                 self.mq.put({"type": "_disconnected"})
                 break
@@ -417,16 +702,18 @@ class ArenaClient:
             t   = msg.get("type")
 
             if t == "_disconnected":
-                self.state     = "CONNECT"
-                self.error_msg = "Disconnected from server."
+                self._reset_to_connect("Disconnected from server.")
 
             elif t == "username_ok":
                 self.username = msg["username"]
                 self.state    = "LOBBY"
+                self.pending_from = None
                 self.error_msg = ""
+                self.error_timer = 0
+                self._apply_window_size()
 
             elif t == "username_taken":
-                self.error_msg = "Username already taken - try another."
+                self._set_error("Username already taken - try another.")
 
             elif t == "lobby_update":
                 self.lobby_players = [p for p in msg.get("players", [])
@@ -434,27 +721,34 @@ class ArenaClient:
                 self.lobby_games   = msg.get("games", [])
                 self.lobby_viewing = [v for v in msg.get("viewing", [])
                                       if v != self.username]
+                if self.pending_from and self.pending_from not in self.lobby_players:
+                    self.pending_from = None
 
             elif t == "challenge_request":
-                self.pending_from = msg.get("from")
+                if self.state == "LOBBY":
+                    self.pending_from = msg.get("from")
 
             elif t == "challenge_sent":
-                self.error_msg = f"Challenge sent to {msg.get('target')} - waiting..."
+                self._set_error(f"Challenge sent to {msg.get('target')} - waiting...")
 
             elif t == "challenge_declined":
-                self.error_msg = f"{msg.get('from')} declined your challenge."
+                self._set_error(f"{msg.get('from')} declined your challenge.")
+
+            elif t == "challenge_cancelled":
+                if self.pending_from == msg.get("from"):
+                    self.pending_from = None
+                self._set_error(msg.get("msg", "Challenge cancelled."))
 
             elif t == "game_start":
+                self._clear_game_context()
                 self.player_id       = msg["player_id"]
                 self.game_id         = msg.get("game_id", "")
                 self.opponent        = msg.get("opponent", "")
                 self.gw              = msg.get("grid_w", GRID_W)
                 self.gh              = msg.get("grid_h", GRID_H)
                 self.state           = "CUSTOMIZE"
-                self.game_state      = None
-                self.game_over_data  = None
-                self.chat_log        = []
                 self.error_msg       = ""
+                self.error_timer     = 0
                 self.customize_ready = False
                 self.binding_slot    = None
                 self.custom_color    = ([0, 210, 90] if self.player_id == 1
@@ -462,23 +756,30 @@ class ArenaClient:
                 self._apply_window_size()
 
             elif t == "game_begin":
-                self.state = "GAME"
-                self._apply_window_size()
+                if self.state == "CUSTOMIZE":
+                    self.state = "GAME"
+                    self._apply_window_size()
 
             elif t == "watch_ok":
+                self._clear_game_context()
                 self.watching_game_id = msg.get("game_id", "")
                 self.gw    = msg.get("grid_w", GRID_W)
                 self.gh    = msg.get("grid_h", GRID_H)
                 self.state = "WATCHING"
-                self.chat_log = []
                 self._apply_window_size()
 
             elif t == "game_state":
-                self.game_state = msg
+                if self.state in ("GAME", "WATCHING", "GAME_OVER"):
+                    self._maybe_trigger_board_animations(msg)
+                    self.game_state = msg
 
             elif t == "game_over":
-                self.game_over_data = msg
-                self.state          = "GAME_OVER"
+                if self.state == "WATCHING":
+                    winner = msg.get("winner", "Unknown")
+                    self._enter_lobby(f"Game ended. Winner: {winner}.")
+                elif self.state in ("CUSTOMIZE", "GAME", "GAME_OVER"):
+                    self.game_over_data = msg
+                    self.state = "GAME_OVER"
 
             elif t in ("game_chat", "lobby_chat"):
                 line = f"{msg.get('from','?')}: {msg.get('msg','')}"
@@ -486,12 +787,15 @@ class ArenaClient:
                 if len(self.chat_log) > 80:
                     self.chat_log.pop(0)
 
+            elif t == "match_cancelled":
+                self._enter_lobby(msg.get("msg", "Match cancelled."))
+
             elif t == "error":
-                self.error_msg = msg.get("msg", "Unknown error")
+                self._set_error(msg.get("msg", "Unknown error"))
 
     def _set_error(self, msg):
-        self.error_msg   = msg
-        self.error_timer = 240   # frames
+        self.error_msg = msg
+        self.error_timer = 240 if msg else 0
 
     # ── Try to connect to server ──────────────
     def _try_connect(self):
@@ -502,6 +806,7 @@ class ArenaClient:
             self._set_error("Invalid port number.")
             return
         try:
+            self._close_connection()
             self.conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.conn.settimeout(5)
             self.conn.connect((ip, port))
@@ -509,6 +814,7 @@ class ArenaClient:
             threading.Thread(target=self._net_thread, daemon=True).start()
             self.state     = "USERNAME"
             self.error_msg = ""
+            self.error_timer = 0
             self._build_username_ui()
         except Exception as e:
             self._set_error(f"Connection failed: {e}")
@@ -820,6 +1126,8 @@ class ArenaClient:
         screen_w, screen_h = self.screen.get_size()
         board_x = (screen_w - full_w) // 2
         board_y = (screen_h - game_h) // 2
+        self._board_x = board_x
+        self._board_y = board_y
         self.screen.fill(C["bg"])
 
         # Grid lines
@@ -840,6 +1148,7 @@ class ArenaClient:
             return
 
         gs = self.game_state
+        effects = gs.get("effects", {})
 
         # Obstacles
         for ox, oy in gs.get("obstacles", []):
@@ -858,8 +1167,14 @@ class ArenaClient:
             cx_    = board_x + px * CELL + CELL // 2
             cy_    = board_y + py * CELL + CELL // 2
             r      = CELL // 2 - 2
-            pygame.draw.circle(self.screen, color, (cx_, cy_), r)
-            pygame.draw.circle(self.screen, C["white"], (cx_, cy_), r, 1)
+            if pie.get("kind") == "poison":
+                self._draw_poison_skull((cx_, cy_), r)
+            else:
+                pulse_r = r + (1 if pie.get("kind") == "golden" else 0)
+                pygame.draw.circle(self.screen, color, (cx_, cy_), pulse_r)
+                pygame.draw.circle(self.screen, C["white"], (cx_, cy_), pulse_r, 1)
+                if pie.get("kind") == "golden":
+                    pygame.draw.circle(self.screen, (255, 245, 180), (cx_ - 3, cy_ - 3), max(2, r // 3))
 
         # Power-ups
         for pu in gs.get("powerups", []):
@@ -868,10 +1183,16 @@ class ArenaClient:
             cx_      = board_x + px_ * CELL + CELL // 2
             cy_      = board_y + py_ * CELL + CELL // 2
             r        = CELL // 2 - 2
-            pts      = [(cx_, cy_ - r), (cx_ + r, cy_),
-                        (cx_, cy_ + r), (cx_ - r, cy_)]
-            pygame.draw.polygon(self.screen, color, pts)
-            pygame.draw.polygon(self.screen, C["white"], pts, 1)
+            if pu.get("kind") == "shield":
+                self._draw_shield_pickup((cx_, cy_), r, color)
+            elif pu.get("kind") == "freeze":
+                self._draw_freeze_pickup((cx_, cy_), r, color)
+            else:
+                pts = [(cx_, cy_ - r), (cx_ + r, cy_),
+                       (cx_, cy_ + r), (cx_ - r, cy_)]
+                pygame.draw.polygon(self.screen, color, pts)
+                pygame.draw.polygon(self.screen, C["white"], pts, 1)
+                pygame.draw.circle(self.screen, (255, 245, 180), (cx_, cy_), max(2, r // 3))
 
         # Snakes
         for pid_s, snake in gs.get("snakes", {}).items():
@@ -894,6 +1215,13 @@ class ArenaClient:
                 else:
                     pygame.draw.rect(self.screen, body_c, rect, border_radius=2)
 
+            snake_effects = effects.get(pid_s, [])
+            if "shield" in snake_effects:
+                self._draw_shield_ring(snake)
+            if "freeze" in snake_effects:
+                self._draw_freeze_overlay(snake)
+
+        self._draw_board_animations()
         self._draw_panel(board_x + game_w, board_y, game_h)
 
     def _draw_panel(self, panel_x, panel_y, game_h):
@@ -1072,23 +1400,26 @@ class ArenaClient:
         cust_key_rects     = {}   # direction -> Rect
         cust_ready_r       = None
 
-        chat_active = False   # in-game chat input focus
-
         while True:
             self.clock.tick(60)
             self._process_queue()
+            if self.error_timer > 0:
+                self.error_timer -= 1
+                if self.error_timer == 0:
+                    self.error_msg = ""
 
             events = pygame.event.get()
             for event in events:
                 if event.type == pygame.QUIT:
+                    self._close_connection()
                     pygame.quit()
                     sys.exit()
 
                 # ── CONNECT ───────────────────
                 if self.state == "CONNECT":
-                    self.ip_input.handle(event)
-                    entered = self.port_input.handle(event)
-                    if self.conn_btn.clicked(event) or entered:
+                    ip_entered = self.ip_input.handle(event)
+                    port_entered = self.port_input.handle(event)
+                    if self.conn_btn.clicked(event) or ip_entered or port_entered:
                         self._try_connect()
 
                 # ── USERNAME ──────────────────
@@ -1154,6 +1485,10 @@ class ArenaClient:
                             self.binding_slot    = None
                     elif event.type == pygame.KEYDOWN:
                         if self.binding_slot:
+                            if event.key in RESERVED_BIND_KEYS:
+                                self._set_error("That key is reserved.")
+                                self.binding_slot = None
+                                continue
                             direction = self.binding_slot
                             # Remove any existing mapping for this key or direction
                             self.key_map = {k: v for k, v in self.key_map.items()
@@ -1174,7 +1509,6 @@ class ArenaClient:
                         self._send({"type": "game_chat",
                                     "msg": self._game_chat_input.text.strip()})
                         self._game_chat_input.set_text("")
-                        chat_active = False
 
                     # Keyboard movement (only when chat input not focused)
                     if (self.state == "GAME" and event.type == pygame.KEYDOWN
@@ -1191,9 +1525,7 @@ class ArenaClient:
                 # ── GAME OVER ─────────────────
                 elif self.state == "GAME_OVER":
                     if back_btn and back_btn.clicked(event):
-                        self.state = "LOBBY"
-                        self._apply_window_size()
-                        self.__dict__.pop("_game_chat_input", None)
+                        self._enter_lobby()
 
             # ── DRAW ──────────────────────────
             if self.state == "CONNECT":
