@@ -1,1023 +1,1309 @@
 """
 Python Arena - Server
 EECE 350 - Computing Networks Project
-Two-player online snake battle game server.
 
-Usage: python arena_server.py [port]
-Default port: 8000
+Usage: py -3 arena_server.py
 """
 
 import json
 import random
 import socket
-import sys
 import threading
 import time
+import uuid
 
+
+HOST = "0.0.0.0"
+PORT = 8000
 
 GRID_W = 36
 GRID_H = 24
-GAME_DURATION = 120
-TICK_RATE = 9
-INITIAL_HP = 100
-MAX_HP = 200
-MAX_PIES = 7
-MAX_POWERUPS = 2
-POWERUP_DURATION = 50
-SHIELD_DURATION = 30
-READY_TIMEOUT = 30
-MAX_MESSAGE_BYTES = 8192
-MAX_USERNAME_LEN = 20
-MAX_CHAT_LEN = 80
+TICK_RATE = 8
+CUSTOMIZE_TIMEOUT = 45.0
+ROUND_TRANSITION = 2.2
 
-PIE_TYPES = [
-    {"kind": "normal", "delta": +15, "color": [0, 200, 60]},
-    {"kind": "golden", "delta": +30, "color": [255, 215, 0]},
-    {"kind": "poison", "delta": -20, "color": [180, 0, 220]},
-]
+VALID_MODES = ("base", "sudden_death", "fog_of_war", "best_of_3")
+VALID_MAPS = ("ember", "frost", "vault")
 
-POWERUP_TYPES = [
-    {"kind": "shield", "color": [180, 180, 220]},
-    {"kind": "freeze", "color": [0, 210, 240]},
-    {"kind": "double", "color": [255, 200, 50]},
-]
+PIE_COLORS = {
+    "normal": [100, 200, 100],
+    "golden": [255, 215, 50],
+    "poison": [200, 50, 150],
+}
 
-OBSTACLES = [
-    (7, 3), (7, 4), (8, 3),
-    (22, 3), (22, 4), (21, 3),
-    (14, 9), (15, 9), (14, 10), (15, 10),
-    (7, 16), (7, 15), (8, 16),
-    (22, 16), (22, 15), (21, 16),
-]
+POWERUP_COLORS = {
+    "shield": [180, 180, 220],
+    "freeze": [0, 210, 240],
+    "double": [255, 200, 50],
+}
+
+DIRS = {
+    "UP": (0, -1),
+    "DOWN": (0, 1),
+    "LEFT": (-1, 0),
+    "RIGHT": (1, 0),
+}
+
+OPPOSITE = {
+    "UP": "DOWN",
+    "DOWN": "UP",
+    "LEFT": "RIGHT",
+    "RIGHT": "LEFT",
+}
+
+MAPS = {
+    "ember": {
+        "name": "Ember Forge",
+        "obstacles": [
+            (12, 5), (13, 5), (22, 5), (23, 5),
+            (12, 6), (23, 6),
+            (6, 8), (7, 8), (28, 8), (29, 8),
+            (6, 15), (7, 15), (28, 15), (29, 15),
+            (12, 18), (13, 18), (22, 18), (23, 18),
+            (12, 17), (23, 17),
+            (17, 10), (18, 10), (17, 13), (18, 13),
+        ],
+    },
+    "frost": {
+        "name": "Frost Lattice",
+        "obstacles": [
+            (9, 4), (9, 5), (9, 6), (9, 17), (9, 18), (9, 19),
+            (26, 4), (26, 5), (26, 6), (26, 17), (26, 18), (26, 19),
+            (15, 9), (16, 9), (19, 9), (20, 9),
+            (15, 14), (16, 14), (19, 14), (20, 14),
+            (17, 7), (18, 7), (17, 16), (18, 16),
+        ],
+    },
+    "vault": {
+        "name": "Vault Rings",
+        "obstacles": [
+            (6, 5), (7, 5), (8, 5), (27, 5), (28, 5), (29, 5),
+            (6, 18), (7, 18), (8, 18), (27, 18), (28, 18), (29, 18),
+            (15, 4), (16, 4), (19, 4), (20, 4),
+            (15, 19), (16, 19), (19, 19), (20, 19),
+            (4, 10), (4, 11), (4, 12), (31, 10), (31, 11), (31, 12),
+            (17, 10), (18, 10), (17, 13), (18, 13),
+        ],
+    },
+}
 
 
-def _encode_msg(msg):
-    return (json.dumps(msg) + "\n").encode("utf-8")
+def now():
+    return time.time()
 
 
-def _send_raw(conn, data):
-    try:
-        conn.sendall(data)
-        return True
-    except Exception:
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def clean_text(value, limit=80):
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    return "".join(ch for ch in text if ch.isprintable())[:limit]
+
+
+def valid_username(value):
+    text = clean_text(value, 20)
+    if not (2 <= len(text) <= 20):
+        return None
+    if not all(ch.isalnum() or ch in "_-" for ch in text):
+        return None
+    return text
+
+
+class ClientConn:
+    def __init__(self, conn, addr):
+        self.conn = conn
+        self.addr = addr
+        self.username = None
+        self.state = "CONNECTED"
+        self.game_id = None
+        self.watching_game_id = None
+        self.closed = False
+        self.send_lock = threading.Lock()
+
+    def send(self, payload):
+        if self.closed:
+            return False
+        raw = (json.dumps(payload) + "\n").encode("utf-8")
         try:
-            conn.close()
+            with self.send_lock:
+                self.conn.sendall(raw)
+            return True
+        except Exception:
+            self.closed = True
+            return False
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.conn.close()
         except Exception:
             pass
-        return False
 
 
-def send_msg(conn, msg):
-    return _send_raw(conn, _encode_msg(msg))
-
-
-def sanitize_username(username):
-    if not isinstance(username, str):
-        return None
-    username = username.strip()
-    if not username or len(username) > MAX_USERNAME_LEN:
-        return None
-    if any((not ch.isprintable()) or ch in ":\r\n\t" for ch in username):
-        return None
-    return username
-
-
-def sanitize_chat(text):
-    if not isinstance(text, str):
-        return None
-    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()
-    if not text:
-        return None
-    text = "".join(ch for ch in text if ch.isprintable())
-    return text[:MAX_CHAT_LEN] if text else None
-
-
-def normalize_color(color):
-    if not isinstance(color, (list, tuple)) or len(color) != 3:
-        return None
-    normalized = []
-    for channel in color:
-        if not isinstance(channel, (int, float)):
-            return None
-        normalized.append(max(0, min(255, int(channel))))
-    return normalized
-
-
-class Snake:
-    OPPOSITES = {"UP": "DOWN", "DOWN": "UP", "LEFT": "RIGHT", "RIGHT": "LEFT"}
-    DELTAS = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
-
-    def __init__(self, pid, head, direction):
-        dx, dy = self.DELTAS[direction]
-        self.pid = pid
-        self.body = [head, (head[0] - dx, head[1] - dy)]
-        self.direction = direction
-        self.next_dir = direction
-        self.health = INITIAL_HP
-        self.alive = True
-        self.grow = False
-
-    def set_direction(self, direction):
-        if direction in self.DELTAS and direction != self.OPPOSITES.get(self.direction):
-            self.next_dir = direction
-
-    def step(self, grid_w, grid_h):
-        self.direction = self.next_dir
-        dx, dy = self.DELTAS[self.direction]
-        hx, hy = self.body[0]
-        new_head = ((hx + dx) % grid_w, (hy + dy) % grid_h)
-        self.body.insert(0, new_head)
-        if self.grow:
-            self.grow = False
-        else:
-            self.body.pop()
-        return new_head
-
-    def to_dict(self):
-        return {
-            "pid": self.pid,
-            "body": self.body,
-            "health": self.health,
-            "alive": self.alive,
-            "direction": self.direction,
-        }
+class PendingChallenge:
+    def __init__(self, challenger, target, mode, map_preference):
+        self.id = uuid.uuid4().hex[:12]
+        self.challenger = challenger
+        self.target = target
+        self.mode = mode
+        self.map_preference = map_preference
+        self.created_at = now()
 
 
 class GameSession:
-    def __init__(self, game_id, p1, p2):
-        self.game_id = game_id
-        self.players = {1: p1, 2: p2}
-        self.snakes = {
-            1: Snake(1, (4, GRID_H // 2), "RIGHT"),
-            2: Snake(2, (GRID_W - 5, GRID_H // 2), "LEFT"),
+    def __init__(self, server, player1, player2, mode, challenger_map):
+        self.server = server
+        self.id = uuid.uuid4().hex[:10]
+        self.rlock = threading.RLock()
+        self.players = {1: player1, 2: player2}
+        self.user_to_pid = {player1: 1, player2: 2}
+        self.mode = mode
+        self.target_wins = 2 if mode == "best_of_3" else 1
+        self.round_number = 1
+        self.round_wins = {player1: 0, player2: 0}
+        self.phase = "PREPARING"
+        self.created_at = now()
+        self.ready = {player1: False, player2: False}
+        self.colors = {
+            player1: [0, 210, 90],
+            player2: [30, 140, 255],
         }
-        self.obstacles = set(OBSTACLES)
+        self.selected_map = challenger_map if challenger_map in VALID_MAPS else "ember"
+        self.map_votes = {player1: self.selected_map, player2: self.selected_map}
+        self.obstacles = []
+        self.viewers = set()
+        self.chat_log = []
+        self.event_log = []
+        self.countdown_deadline = None
+        self.round_deadline = None
+        self.stop_event = threading.Event()
+        self.forfeit = None
+        self.final_winner = None
+        self.final_reason = ""
+        self.last_snapshot = None
+        self.snakes = {}
         self.pies = []
         self.powerups = []
-        self.viewers = set()
-        self.colors = {1: [0, 210, 90], 2: [30, 140, 255]}
-        self.effects = {1: {}, 2: {}}
-        self.ready = {1: False, 2: False}
-        self.rlock = threading.RLock()
-        self.start_event = threading.Event()
-        self.running = False
-        self.start_time = None
-        self.ended = False
-        self.cancelled = False
-        self._spawn_pies()
+        self.safe_zone = None
+        self.next_powerup_time = 0.0
+        self.next_pie_time = 0.0
+        self.thread = threading.Thread(target=self.run, daemon=True)
 
-    def add_viewer(self, username):
-        if username not in (self.players[1]["username"], self.players[2]["username"]):
-            self.viewers.add(username)
+    def start(self):
+        self.thread.start()
+
+    def time_limit(self):
+        if self.mode == "sudden_death":
+            return 55
+        return 90
+
+    def add_event(self, text):
+        text = clean_text(text, 70)
+        if not text:
+            return
+        with self.rlock:
+            self.event_log.append(text)s
+            self.event_log = self.event_log[-7:]
+
+    def mark_forfeit(self, username, reason):
+        with self.rlock:
+            if self.phase in ("FINISHED", "CANCELLED"):
+                return
+            if username in self.user_to_pid:
+                self.forfeit = (username, reason)
 
     def remove_viewer(self, username):
-        self.viewers.discard(username)
+        with self.rlock:
+            self.viewers.discard(username)
 
-    def _spawn_pies(self):
-        occupied = set(self.obstacles)
-        for snake in self.snakes.values():
-            occupied.update(map(tuple, snake.body))
-        occupied.update(tuple(pie["pos"]) for pie in self.pies)
+    def add_viewer(self, username):
+        with self.rlock:
+            self.viewers.add(username)
 
-        attempts = 0
-        while len(self.pies) < MAX_PIES and attempts < 200:
-            attempts += 1
-            pos = (random.randint(1, GRID_W - 2), random.randint(1, GRID_H - 2))
-            if pos in occupied:
-                continue
-            pie_type = random.choice(PIE_TYPES)
-            self.pies.append({
-                "pos": pos,
-                "kind": pie_type["kind"],
-                "delta": pie_type["delta"],
-                "color": pie_type["color"],
-            })
-            occupied.add(pos)
+    def player_client(self, username):
+        return self.server.get_client(username)
 
-    def _spawn_powerup(self):
-        if len(self.powerups) >= MAX_POWERUPS or random.random() > 0.05:
-            return
-
-        occupied = set(self.obstacles)
-        for snake in self.snakes.values():
-            occupied.update(map(tuple, snake.body))
-        occupied.update(tuple(pie["pos"]) for pie in self.pies)
-        occupied.update(tuple(powerup["pos"]) for powerup in self.powerups)
-
-        for _ in range(50):
-            pos = (random.randint(1, GRID_W - 2), random.randint(1, GRID_H - 2))
-            if pos in occupied:
-                continue
-            powerup_type = random.choice(POWERUP_TYPES)
-            self.powerups.append({
-                "pos": pos,
-                "kind": powerup_type["kind"],
-                "color": powerup_type["color"],
-            })
-            break
-
-    def _apply_damage(self, pid, amount):
-        snake = self.snakes[pid]
-        if not snake.alive:
-            return
-        if "shield" in self.effects[pid]:
-            del self.effects[pid]["shield"]
-            return
-        snake.health = max(0, snake.health - amount)
-        if snake.health <= 0:
-            snake.alive = False
-
-    def _collect_powerup(self, pid, kind):
-        if kind == "shield":
-            self.effects[pid]["shield"] = SHIELD_DURATION
-        elif kind == "freeze":
-            self.effects[3 - pid]["freeze"] = POWERUP_DURATION
-        elif kind == "double":
-            self.effects[pid]["double"] = POWERUP_DURATION
-
-    def _tick_effects(self):
-        for pid in (1, 2):
-            for kind in list(self.effects[pid]):
-                self.effects[pid][kind] -= 1
-                if self.effects[pid][kind] <= 0:
-                    del self.effects[pid][kind]
-
-    def _apply_hits_in_order(self, pid, hits):
-        for _, amount in hits:
-            self._apply_damage(pid, amount)
-            if not self.snakes[pid].alive:
-                break
-
-    def update(self):
-        """
-        Advance the game state by one tick.
-        Called while game.rlock is held.
-        Returns (game_over: bool, winner_pid: int|0, time_left: float)
-        """
-        self._tick_effects()
-
-        old_heads = {}
-        planned_heads = {}
-        for pid, snake in self.snakes.items():
-            if not snake.alive:
-                continue
-            if "freeze" in self.effects[pid]:
-                snake.next_dir = snake.direction
-            dx, dy = Snake.DELTAS[snake.next_dir]
-            hx, hy = snake.body[0]
-            old_heads[pid] = tuple(snake.body[0])
-            planned_heads[pid] = ((hx + dx) % GRID_W, (hy + dy) % GRID_H)
-
-        for pid, snake in self.snakes.items():
-            if snake.alive:
-                snake.step(GRID_W, GRID_H)
-
-        hits = {1: [], 2: []}
-        alive_now = {pid for pid, snake in self.snakes.items() if snake.alive}
-
-        for pid in alive_now:
-            head = tuple(self.snakes[pid].body[0])
-            if head in self.obstacles:
-                hits[pid].append(("obstacle", 25))
-            if head in set(map(tuple, self.snakes[pid].body[1:])):
-                hits[pid].append(("self", 15))
-
-        if 1 in alive_now and 2 in alive_now:
-            same_head = planned_heads[1] == planned_heads[2]
-            head_swap = (
-                planned_heads[1] == old_heads[2]
-                and planned_heads[2] == old_heads[1]
-            )
-            if same_head or head_swap:
-                hits[1].append(("head", 30))
-                hits[2].append(("head", 30))
-            else:
-                body_1 = set(map(tuple, self.snakes[1].body[1:]))
-                body_2 = set(map(tuple, self.snakes[2].body[1:]))
-                if planned_heads[1] in body_2:
-                    hits[1].append(("other", 30))
-                if planned_heads[2] in body_1:
-                    hits[2].append(("other", 30))
-
-        for pid in (1, 2):
-            self._apply_hits_in_order(pid, hits[pid])
-
-        for pid in (1, 2):
-            snake = self.snakes[pid]
-            if not snake.alive:
-                continue
-
-            head = tuple(snake.body[0])
-            for pie in self.pies[:]:
-                if head != tuple(pie["pos"]):
-                    continue
-                delta = pie["delta"]
-                if "double" in self.effects[pid] and delta > 0:
-                    delta *= 2
-                snake.health = max(0, min(MAX_HP, snake.health + delta))
-                snake.grow = True
-                self.pies.remove(pie)
-                if snake.health <= 0:
-                    snake.alive = False
-                break
-
-            if not snake.alive:
-                continue
-
-            for powerup in self.powerups[:]:
-                if head != tuple(powerup["pos"]):
-                    continue
-                self._collect_powerup(pid, powerup["kind"])
-                self.powerups.remove(powerup)
-                break
-
-        self._spawn_pies()
-        self._spawn_powerup()
-
-        elapsed = time.time() - self.start_time if self.start_time else 0.0
-        time_left = max(0.0, GAME_DURATION - elapsed)
-
-        s1, s2 = self.snakes[1], self.snakes[2]
-        if not s1.alive or not s2.alive or time_left <= 0:
-            if s1.health > s2.health:
-                winner = 1
-            elif s2.health > s1.health:
-                winner = 2
-            else:
-                winner = 0
-            return True, winner, time_left
-
-        return False, None, time_left
-
-    def get_state(self, time_left):
-        snakes_data = {}
-        for pid, snake in self.snakes.items():
-            snake_dict = snake.to_dict()
-            snake_dict["color"] = self.colors.get(pid, [200, 200, 200])
-            snakes_data[str(pid)] = snake_dict
-
-        return {
-            "type": "game_state",
-            "game_id": self.game_id,
-            "snakes": snakes_data,
-            "pies": [
-                {"pos": list(pie["pos"]), "kind": pie["kind"], "color": pie["color"]}
-                for pie in self.pies
-            ],
-            "powerups": [
-                {
-                    "pos": list(powerup["pos"]),
-                    "kind": powerup["kind"],
-                    "color": powerup["color"],
-                }
-                for powerup in self.powerups
-            ],
-            "effects": {
-                str(pid): list(effects.keys())
-                for pid, effects in self.effects.items()
-            },
-            "obstacles": [list(obstacle) for obstacle in self.obstacles],
-            "time_left": round(time_left, 1),
-            "usernames": {
-                str(pid): player["username"] for pid, player in self.players.items()
-            },
-        }
-
-
-class Server:
-    def __init__(self, port):
-        self.port = port
-        self.clients = {}
-        self.active_games = {}
-        self.pending_from = {}
-        self.pending_to = {}
-        self._game_counter = 0
-        self.lock = threading.Lock()
-
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("", port))
-        self.sock.listen()
-
-        ip = socket.gethostbyname(socket.gethostname())
-        print(f"[SERVER] Python Arena running on {ip}:{port}")
-        print(
-            f"[SERVER] Grid {GRID_W}x{GRID_H} | "
-            f"{GAME_DURATION}s matches | {TICK_RATE} TPS"
-        )
-
-    def _next_game_id_locked(self):
-        self._game_counter += 1
-        return f"game_{self._game_counter}"
-
-    def _player_pid(self, game, username):
-        for pid, player in game.players.items():
-            if player["username"] == username:
-                return pid
-        return None
-
-    def _broadcast_lobby(self):
-        with self.lock:
-            client_snapshot = [
-                (username, data["conn"], data["state"])
-                for username, data in self.clients.items()
-            ]
-            games_snapshot = list(self.active_games.values())
-
-        lobby = [username for username, _, state in client_snapshot if state == "lobby"]
-        viewing = [username for username, _, state in client_snapshot if state == "viewing"]
-        recipients = [conn for _, conn, state in client_snapshot if state == "lobby"]
-        games = []
-        for game in games_snapshot:
-            with game.rlock:
-                if game.ended or not game.running:
-                    continue
-                games.append({
-                    "game_id": game.game_id,
-                    "player1": game.players[1]["username"],
-                    "player2": game.players[2]["username"],
-                    "viewers": len(game.viewers),
-                })
-
-        msg = {"type": "lobby_update", "players": lobby, "games": games, "viewing": viewing}
-        for conn in recipients:
-            send_msg(conn, msg)
-
-    def _clear_challenges_for_locked(self, username, notify=True):
-        notifications = []
-
-        target = self.pending_to.pop(username, None)
-        if target and self.pending_from.get(target) == username:
-            del self.pending_from[target]
-            target_info = self.clients.get(target)
-            if notify and target_info and target_info["state"] == "lobby":
-                notifications.append((
-                    target_info["conn"],
-                    {
-                        "type": "challenge_cancelled",
-                        "from": username,
-                        "msg": f"{username} cancelled the challenge.",
-                    },
-                ))
-
-        challenger = self.pending_from.pop(username, None)
-        if challenger and self.pending_to.get(challenger) == username:
-            del self.pending_to[challenger]
-            challenger_info = self.clients.get(challenger)
-            if notify and challenger_info and challenger_info["state"] == "lobby":
-                notifications.append((
-                    challenger_info["conn"],
-                    {
-                        "type": "challenge_cancelled",
-                        "from": username,
-                        "msg": f"{username} is no longer available.",
-                    },
-                ))
-
-        return notifications
-
-    def _collect_game_recipients(self, game):
-        with game.rlock:
-            viewer_names = list(game.viewers)
-            player_names = [game.players[1]["username"], game.players[2]["username"]]
-
+    def participants(self):
+        with self.rlock:
+            usernames = [self.players[1], self.players[2], *self.viewers]
         recipients = []
-        stale_viewers = []
-        with self.lock:
-            for username in player_names:
-                data = self.clients.get(username)
-                if not data or data.get("game") is not game:
-                    continue
-                recipients.append((username, data["conn"], "player"))
-            for username in viewer_names:
-                data = self.clients.get(username)
-                if not data or data["state"] != "viewing" or data.get("game") is not game:
-                    stale_viewers.append(username)
-                    continue
-                recipients.append((username, data["conn"], "viewer"))
-
-        if stale_viewers:
-            with game.rlock:
-                for username in stale_viewers:
-                    game.remove_viewer(username)
+        for uname in usernames:
+            client = self.server.get_client(uname)
+            if client is not None:
+                recipients.append(client)
         return recipients
 
-    def _send_to_game(self, game, msg):
-        data = _encode_msg(msg)
-        stale_viewers = []
-        for username, conn, role in self._collect_game_recipients(game):
-            if not _send_raw(conn, data) and role == "viewer":
-                stale_viewers.append(username)
-        if stale_viewers:
-            with game.rlock:
-                for username in stale_viewers:
-                    game.remove_viewer(username)
-
-    def _finish_game(self, game, winner_pid=None, cancel_reason=None, system_text=None):
-        with game.rlock:
-            if game.ended:
-                return False
-            game.ended = True
-            game.running = False
-            if cancel_reason:
-                game.cancelled = True
-            game.start_event.set()
-            players = {pid: player["username"] for pid, player in game.players.items()}
-            scores = {players[pid]: game.snakes[pid].health for pid in (1, 2)}
-            game.viewers.clear()
-
+    def player_recipients(self):
         recipients = []
-        with self.lock:
-            self.active_games.pop(game.game_id, None)
-            for username, data in self.clients.items():
-                if data.get("game") is not game:
-                    continue
-                recipients.append((username, data["conn"], data["state"]))
-                data.update(state="lobby", game=None, player_id=None)
+        for pid in (1, 2):
+            client = self.server.get_client(self.players[pid])
+            if client is not None:
+                recipients.append(client)
+        return recipients
 
-        if system_text:
-            chat_msg = {"type": "game_chat", "from": "SERVER", "msg": system_text}
-            payload = _encode_msg(chat_msg)
-            for _, conn, _ in recipients:
-                _send_raw(conn, payload)
+    def broadcast(self, payload, players_only=False):
+        recipients = self.player_recipients() if players_only else self.participants()
+        failed = []
+        for client in recipients:
+            if not client.send(payload):
+                failed.append(client.username)
+        for username in failed:
+            self.server.handle_disconnect(username)
 
-        if cancel_reason:
-            cancel_msg = {"type": "match_cancelled", "msg": cancel_reason}
-            payload = _encode_msg(cancel_msg)
-            for _, conn, _ in recipients:
-                _send_raw(conn, payload)
-        else:
-            winner_name = "TIE" if winner_pid == 0 else players.get(winner_pid, "TIE")
-            game_over_msg = {"type": "game_over", "winner": winner_name, "scores": scores}
-            payload = _encode_msg(game_over_msg)
-            for _, conn, _ in recipients:
-                _send_raw(conn, payload)
+    def set_customize(self, username, color=None, map_vote=None, ready=None):
+        changed = False
+        with self.rlock:
+            if self.phase not in ("PREPARING", "ROUND_OVER"):
+                return False
+            if username not in self.user_to_pid:
+                return False
+            if color:
+                self.colors[username] = [int(clamp(v, 0, 255)) for v in color[:3]]
+                changed = True
+            if ready is not None:
+                self.ready[username] = bool(ready)
+                changed = True
+        if changed:
+            self.broadcast_customize_update()
+        return changed
 
-        self._broadcast_lobby()
-        return True
+    def broadcast_customize_update(self):
+        with self.rlock:
+            payload = {
+                "type": "customize_update",
+                "game_id": self.id,
+                "mode": self.mode,
+                "round_number": self.round_number,
+                "target_wins": self.target_wins,
+                "round_wins": dict(self.round_wins),
+                "map_votes": dict(self.map_votes),
+                "selected_map": self.selected_map,
+                "ready": dict(self.ready),
+                "players": {
+                    name: {"color": list(color)}
+                    for name, color in self.colors.items()
+                },
+            }
+        self.broadcast(payload)
 
-    def _recv_message(self, conn, buffer):
-        while "\n" not in buffer:
-            try:
-                chunk = conn.recv(4096)
-            except Exception:
-                return None, buffer, "disconnect"
-            if not chunk:
-                return None, buffer, "disconnect"
-            buffer += chunk.decode("utf-8", errors="ignore")
-            if len(buffer) > MAX_MESSAGE_BYTES:
-                return None, "", "too_large"
+    def resolve_map(self):
+        with self.rlock:
+            if self.selected_map not in VALID_MAPS:
+                self.selected_map = "ember"
+            return self.selected_map
 
-        line, buffer = buffer.split("\n", 1)
-        if len(line) > MAX_MESSAGE_BYTES:
-            return None, buffer, "too_large"
-        if not line.strip():
-            return None, buffer, "malformed"
-        try:
-            msg = json.loads(line)
-        except Exception:
-            return None, buffer, "malformed"
-        if not isinstance(msg, dict):
-            return None, buffer, "malformed"
-        return msg, buffer, None
+    def reset_round_state(self):
+        chosen_map = self.resolve_map()
+        start_1 = [(5, GRID_H // 2), (4, GRID_H // 2), (3, GRID_H // 2)]
+        start_2 = [(GRID_W - 6, GRID_H // 2), (GRID_W - 5, GRID_H // 2), (GRID_W - 4, GRID_H // 2)]
+        with self.rlock:
+            self.phase = "PREPARING"
+            self.obstacles = list(MAPS[chosen_map]["obstacles"])
+            self.pies = []
+            self.powerups = []
+            self.event_log = []
+            self.safe_zone = [0, 0, GRID_W, GRID_H]
+            self.next_powerup_time = now() + 8.0
+            self.next_pie_time = now()
+            self.round_deadline = None
+            self.countdown_deadline = None
+            self.snakes = {
+                "1": {
+                    "body": list(start_1),
+                    "dir": "RIGHT",
+                    "next_dir": "RIGHT",
+                    "health": 100,
+                    "alive": True,
+                    "color": list(self.colors[self.players[1]]),
+                    "effects": {},
+                    "grow": 0,
+                },
+                "2": {
+                    "body": list(start_2),
+                    "dir": "LEFT",
+                    "next_dir": "LEFT",
+                    "health": 100,
+                    "alive": True,
+                    "color": list(self.colors[self.players[2]]),
+                    "effects": {},
+                    "grow": 0,
+                },
+            }
+        while len(self.pies) < 5:
+            self.spawn_pie()
+        if self.mode != "sudden_death":
+            self.spawn_powerup()
+        self.add_event(f"Round {self.round_number} on {MAPS[chosen_map]['name']}.")
 
-    def _handle_lobby_challenge(self, username, msg):
-        target = msg.get("target")
-        notifications = []
+    def spawn_pie(self):
+        with self.rlock:
+            occupied = set(self.obstacles)
+            for snake in self.snakes.values():
+                occupied.update(tuple(cell) for cell in snake["body"])
+            occupied.update(tuple(pie["pos"]) for pie in self.pies)
+            occupied.update(tuple(pu["pos"]) for pu in self.powerups)
+        free = [
+            (x, y)
+            for x in range(GRID_W)
+            for y in range(GRID_H)
+            if (x, y) not in occupied
+        ]
+        if not free:
+            return
+        pos = random.choice(free)
+        roll = random.random()
+        kind = "normal"
+        if roll < 0.14:
+            kind = "golden"
+        elif roll < 0.24:
+            kind = "poison"
+        with self.rlock:
+            self.pies.append({"pos": list(pos), "kind": kind, "color": PIE_COLORS[kind]})
 
-        with self.lock:
-            requester = self.clients.get(username)
-            requester_conn = requester["conn"] if requester else None
+    def spawn_powerup(self):
+        if self.mode == "sudden_death":
+            return
+        with self.rlock:
+            occupied = set(self.obstacles)
+            for snake in self.snakes.values():
+                occupied.update(tuple(cell) for cell in snake["body"])
+            occupied.update(tuple(pie["pos"]) for pie in self.pies)
+            occupied.update(tuple(pu["pos"]) for pu in self.powerups)
+        free = [
+            (x, y)
+            for x in range(GRID_W)
+            for y in range(GRID_H)
+            if (x, y) not in occupied
+        ]
+        if not free:
+            return
+        kind = random.choice(("shield", "freeze", "double"))
+        pos = random.choice(free)
+        with self.rlock:
+            self.powerups = [{"pos": list(pos), "kind": kind, "color": POWERUP_COLORS[kind]}]
 
-            if not isinstance(target, str) or target == username:
-                return [(requester_conn, {"type": "error", "msg": "Invalid challenge target."})]
+    def queue_move(self, username, direction):
+        if direction not in DIRS:
+            return
+        with self.rlock:
+            if self.phase != "ACTIVE":
+                return
+            pid = str(self.user_to_pid.get(username, ""))
+            snake = self.snakes.get(pid)
+            if not snake or not snake["alive"]:
+                return
+            if OPPOSITE[direction] == snake["dir"]:
+                return
+            snake["next_dir"] = direction
 
-            target_info = self.clients.get(target)
-            if not requester or requester["state"] != "lobby":
-                return [(requester_conn, {"type": "error", "msg": "You are not in the lobby."})]
-            if not target_info or target_info["state"] != "lobby":
-                return [(requester_conn, {"type": "error", "msg": "Player not available."})]
-            if (
-                username in self.pending_to
-                or username in self.pending_from
-                or target in self.pending_to
-                or target in self.pending_from
-            ):
-                return [(
-                    requester_conn,
-                    {"type": "error", "msg": "One of the players already has a pending challenge."},
-                )]
+    def remaining_time(self):
+        with self.rlock:
+            if not self.round_deadline:
+                return self.time_limit()
+            return max(0.0, self.round_deadline - now())
 
-            self.pending_to[username] = target
-            self.pending_from[target] = username
-            notifications.append((target_info["conn"], {
-                "type": "challenge_request",
-                "from": username,
-            }))
-
-        if requester_conn:
-            notifications.append((requester_conn, {
-                "type": "challenge_sent",
-                "target": target,
-            }))
-        return notifications
-
-    def _handle_challenge_response(self, username, msg):
-        accepted = bool(msg.get("accepted"))
-        challenger = msg.get("from")
-        notifications = []
-        game_to_start = None
-
-        with self.lock:
-            responder = self.clients.get(username)
-            responder_conn = responder["conn"] if responder else None
-            if not responder or responder["state"] != "lobby":
-                return [(responder_conn, {"type": "error", "msg": "You are not in the lobby."})], None
-
-            if self.pending_from.get(username) != challenger or self.pending_to.get(challenger) != username:
-                return [(responder_conn, {"type": "error", "msg": "That challenge is no longer valid."})], None
-
-            challenger_info = self.clients.get(challenger)
-            if not challenger_info or challenger_info["state"] != "lobby":
-                del self.pending_from[username]
-                del self.pending_to[challenger]
-                return [(responder_conn, {"type": "error", "msg": "The challenger is no longer available."})], None
-
-            del self.pending_from[username]
-            del self.pending_to[challenger]
-
-            if not accepted:
-                notifications.append((challenger_info["conn"], {
-                    "type": "challenge_declined",
-                    "from": username,
-                }))
-                return notifications, None
-
-            self._clear_challenges_for_locked(username, notify=False)
-            self._clear_challenges_for_locked(challenger, notify=False)
-
-            gid = self._next_game_id_locked()
-            game = GameSession(
-                gid,
-                {"username": challenger, "conn": challenger_info["conn"]},
-                {"username": username, "conn": responder_conn},
-            )
-            self.active_games[gid] = game
-            challenger_info.update(state="customizing", player_id=1, game=game)
-            responder.update(state="customizing", player_id=2, game=game)
-            notifications.extend([
-                (challenger_info["conn"], {
-                    "type": "game_start",
-                    "player_id": 1,
-                    "opponent": username,
-                    "game_id": gid,
-                    "grid_w": GRID_W,
-                    "grid_h": GRID_H,
-                }),
-                (responder_conn, {
-                    "type": "game_start",
-                    "player_id": 2,
-                    "opponent": challenger,
-                    "game_id": gid,
-                    "grid_w": GRID_W,
-                    "grid_h": GRID_H,
-                }),
-            ])
-            game_to_start = game
-
-        return notifications, game_to_start
-
-    def _handle_watch_request(self, username, msg):
-        gid = msg.get("game_id")
-        with self.lock:
-            watcher = self.clients.get(username)
-            watcher_conn = watcher["conn"] if watcher else None
-            if not watcher or watcher["state"] != "lobby":
-                return [(watcher_conn, {"type": "error", "msg": "You can only spectate from the lobby."})]
-            game = self.active_games.get(gid)
-            if not game:
-                return [(watcher_conn, {"type": "error", "msg": "Game not found."})]
-
-        with game.rlock:
-            if game.ended or not game.running:
-                return [(watcher_conn, {"type": "error", "msg": "That game is not available to watch yet."})]
-            game.add_viewer(username)
-            usernames = {str(pid): player["username"] for pid, player in game.players.items()}
-
-        notifications = []
-        with self.lock:
-            watcher = self.clients.get(username)
-            if not watcher or watcher["state"] != "lobby":
-                with game.rlock:
-                    game.remove_viewer(username)
-                return [(watcher_conn, {"type": "error", "msg": "You are no longer in the lobby."})]
-            notifications.extend(self._clear_challenges_for_locked(username, notify=True))
-            watcher["state"] = "viewing"
-            watcher["game"] = game
-
-        notifications.append((
-            watcher_conn,
-            {
-                "type": "watch_ok",
-                "game_id": gid,
-                "usernames": usernames,
+    def serialize_state(self):
+        with self.rlock:
+            snapshot = {
+                "type": "game_state",
+                "game_id": self.id,
+                "mode": self.mode,
+                "map_id": self.selected_map,
+                "map_name": MAPS[self.selected_map]["name"] if self.selected_map else "",
                 "grid_w": GRID_W,
                 "grid_h": GRID_H,
-            },
-        ))
-        return notifications
-
-    def _handle_lobby_chat(self, username, msg):
-        text = sanitize_chat(msg.get("msg"))
-        if not text:
-            with self.lock:
-                client = self.clients.get(username)
-                conn = client["conn"] if client else None
-            return [(conn, {"type": "error", "msg": "Chat message cannot be empty."})]
-
-        with self.lock:
-            recipients = [
-                data["conn"] for data in self.clients.values() if data["state"] == "lobby"
-            ]
-
-        payload = {"type": "lobby_chat", "from": username, "msg": text}
-        return [(conn, payload) for conn in recipients]
-
-    def _disconnect_client(self, username, conn):
-        state = None
-        game = None
-        player_id = None
-        notifications = []
-
-        with self.lock:
-            client = self.clients.get(username)
-            if not client or client["conn"] is not conn:
-                return
-            state = client["state"]
-            game = client.get("game")
-            player_id = client.get("player_id")
-            notifications = self._clear_challenges_for_locked(username, notify=True)
-            del self.clients[username]
-
-        for target_conn, msg in notifications:
-            if target_conn:
-                send_msg(target_conn, msg)
-
-        if game:
-            if state == "viewing":
-                with game.rlock:
-                    game.remove_viewer(username)
-                self._broadcast_lobby()
-            elif state == "customizing":
-                self._finish_game(
-                    game,
-                    cancel_reason=f"{username} disconnected before the match started.",
-                )
-            elif state == "playing":
-                winner_pid = 1 if player_id == 2 else 2
-                winner_name = game.players[winner_pid]["username"]
-                self._finish_game(
-                    game,
-                    winner_pid=winner_pid,
-                    system_text=f"{username} disconnected. {winner_name} wins by forfeit.",
-                )
-            else:
-                self._broadcast_lobby()
-        else:
-            self._broadcast_lobby()
-
-        print(f"[-] {username} disconnected")
-
-    def handle_client(self, conn, addr):
-        username = None
-        buffer = ""
-
-        try:
-            while True:
-                msg, buffer, error = self._recv_message(conn, buffer)
-                if error == "disconnect":
-                    return
-                if error == "too_large":
-                    send_msg(conn, {"type": "error", "msg": "Message too large."})
-                    return
-                if error == "malformed":
-                    send_msg(conn, {"type": "error", "msg": "Malformed JSON payload."})
-                    continue
-
-                if msg.get("type") != "username":
-                    send_msg(conn, {"type": "error", "msg": "Send a username first."})
-                    continue
-
-                requested = sanitize_username(msg.get("username"))
-                if not requested:
-                    send_msg(conn, {
-                        "type": "error",
-                        "msg": "Username must be 1-20 printable characters.",
-                    })
-                    continue
-
-                with self.lock:
-                    if requested in self.clients:
-                        send_msg(conn, {"type": "username_taken"})
-                        continue
-                    self.clients[requested] = {
-                        "conn": conn,
-                        "state": "lobby",
-                        "player_id": None,
-                        "game": None,
+                "phase": self.phase,
+                "round_number": self.round_number,
+                "target_wins": self.target_wins,
+                "round_wins": dict(self.round_wins),
+                "time_left": round(self.remaining_time(), 1),
+                "usernames": {"1": self.players[1], "2": self.players[2]},
+                "snakes": {
+                    pid: {
+                        "body": [list(cell) for cell in snake["body"]],
+                        "dir": snake["dir"],
+                        "health": int(clamp(snake["health"], 0, 200)),
+                        "alive": snake["alive"],
+                        "color": list(snake["color"]),
                     }
-                    username = requested
+                    for pid, snake in self.snakes.items()
+                },
+                "effects": {
+                    pid: sorted(list(snake["effects"].keys()))
+                    for pid, snake in self.snakes.items()
+                },
+                "pies": list(self.pies),
+                "powerups": list(self.powerups),
+                "obstacles": [list(cell) for cell in self.obstacles],
+                "event_log": list(self.event_log),
+                "safe_zone": list(self.safe_zone) if self.safe_zone else None,
+            }
+            self.last_snapshot = snapshot
+            return snapshot
 
-                send_msg(conn, {"type": "username_ok", "username": username})
-                self._broadcast_lobby()
-                print(f"[+] {username} connected from {addr}")
-                break
+    def player_summary(self):
+        with self.rlock:
+            return {
+                self.players[int(pid)]: snake["health"]
+                for pid, snake in self.snakes.items()
+            }
 
-            while True:
-                msg, buffer, error = self._recv_message(conn, buffer)
-                if error == "disconnect":
-                    break
-                if error == "too_large":
-                    send_msg(conn, {"type": "error", "msg": "Message too large."})
-                    break
-                if error == "malformed":
-                    send_msg(conn, {"type": "error", "msg": "Malformed JSON payload."})
-                    continue
+    def apply_damage(self, pid, amount, reason):
+        snake = self.snakes[pid]
+        if not snake["alive"] or amount <= 0:
+            return False
+        if "shield" in snake["effects"]:
+            del snake["effects"]["shield"]
+            self.add_event(f"{self.players[int(pid)]} blocked {reason.lower()} with a shield.")
+            return False
+        snake["health"] = clamp(snake["health"] - amount, 0, 200)
+        self.add_event(f"{self.players[int(pid)]} took {amount} from {reason.lower()}.")
+        if snake["health"] <= 0:
+            snake["alive"] = False
+            self.add_event(f"{self.players[int(pid)]} was eliminated.")
+        return True
 
-                mtype = msg.get("type")
-                if not isinstance(mtype, str):
-                    send_msg(conn, {"type": "error", "msg": "Missing message type."})
-                    continue
+    def consume_pie(self, pid, pie):
+        snake = self.snakes[pid]
+        mult = 2 if "double" in snake["effects"] else 1
+        if pie["kind"] == "normal":
+            snake["health"] = clamp(snake["health"] + 15 * mult, 0, 200)
+            snake["grow"] += 1
+            self.add_event(f"{self.players[int(pid)]} ate a pie.")
+        elif pie["kind"] == "golden":
+            snake["health"] = clamp(snake["health"] + 30 * mult, 0, 200)
+            snake["grow"] += 2
+            self.add_event(f"{self.players[int(pid)]} ate a golden pie.")
+        else:
+            self.apply_damage(pid, 20 * mult, "Poison Pie")
 
-                with self.lock:
-                    client = self.clients.get(username)
-                    if not client:
-                        break
-                    state = client["state"]
-                    game = client.get("game")
-                    player_id = client.get("player_id")
+    def consume_powerup(self, pid, powerup):
+        snake = self.snakes[pid]
+        owner = self.players[int(pid)]
+        if powerup["kind"] == "shield":
+            snake["effects"]["shield"] = now() + 9999.0
+            self.add_event(f"{owner} picked up a shield.")
+        elif powerup["kind"] == "double":
+            snake["effects"]["double"] = now() + 5.0
+            self.add_event(f"{owner} activated double pies.")
+        elif powerup["kind"] == "freeze":
+            opp = "2" if pid == "1" else "1"
+            self.snakes[opp]["effects"]["freeze"] = now() + 4.5
+            self.add_event(f"{owner} froze {self.players[int(opp)]}.")
 
-                if state == "lobby":
-                    if mtype == "challenge":
-                        notifications = self._handle_lobby_challenge(username, msg)
-                        for target_conn, out_msg in notifications:
-                            if target_conn:
-                                send_msg(target_conn, out_msg)
-                    elif mtype == "challenge_response":
-                        notifications, game_to_start = self._handle_challenge_response(username, msg)
-                        for target_conn, out_msg in notifications:
-                            if target_conn:
-                                send_msg(target_conn, out_msg)
-                        if game_to_start:
-                            thread = threading.Thread(
-                                target=self._run_game,
-                                args=(game_to_start,),
-                                daemon=True,
-                            )
-                            thread.start()
-                            self._broadcast_lobby()
-                    elif mtype == "watch":
-                        notifications = self._handle_watch_request(username, msg)
-                        for target_conn, out_msg in notifications:
-                            if target_conn:
-                                send_msg(target_conn, out_msg)
-                        self._broadcast_lobby()
-                    elif mtype == "lobby_chat":
-                        notifications = self._handle_lobby_chat(username, msg)
-                        for target_conn, out_msg in notifications:
-                            if target_conn:
-                                send_msg(target_conn, out_msg)
-                    else:
-                        send_msg(conn, {"type": "error", "msg": "Invalid action in the lobby."})
+    def expire_effects(self):
+        t = now()
+        with self.rlock:
+            for snake in self.snakes.values():
+                expired = [name for name, deadline in snake["effects"].items() if deadline <= t]
+                for name in expired:
+                    del snake["effects"][name]
 
-                elif state == "customizing":
-                    if mtype != "player_ready" or not game or not player_id:
-                        send_msg(conn, {"type": "error", "msg": "Invalid action during customization."})
-                        continue
-
-                    color = normalize_color(msg.get("color"))
-                    begin_match = False
-                    with game.rlock:
-                        if game.ended:
-                            continue
-                        game.ready[player_id] = True
-                        if color:
-                            game.colors[player_id] = color
-                        begin_match = all(game.ready.values())
-
-                    if begin_match:
-                        with self.lock:
-                            valid = True
-                            for pid in (1, 2):
-                                player_name = game.players[pid]["username"]
-                                pdata = self.clients.get(player_name)
-                                if not pdata or pdata["state"] != "customizing" or pdata.get("game") is not game:
-                                    valid = False
-                                    break
-                            if valid:
-                                for pid in (1, 2):
-                                    player_name = game.players[pid]["username"]
-                                    self.clients[player_name]["state"] = "playing"
-                        if begin_match and valid:
-                            self._send_to_game(game, {"type": "game_begin"})
-                            game.start_event.set()
-
-                elif state == "playing":
-                    if not game or not player_id:
-                        send_msg(conn, {"type": "error", "msg": "You are not attached to a game."})
-                        continue
-
-                    if mtype == "move":
-                        direction = msg.get("direction")
-                        if direction not in Snake.DELTAS:
-                            send_msg(conn, {"type": "error", "msg": "Invalid move direction."})
-                            continue
-                        with game.rlock:
-                            if not game.ended and game.snakes[player_id].alive:
-                                game.snakes[player_id].set_direction(direction)
-                    elif mtype == "game_chat":
-                        text = sanitize_chat(msg.get("msg"))
-                        if not text:
-                            send_msg(conn, {"type": "error", "msg": "Chat message cannot be empty."})
-                            continue
-                        self._send_to_game(game, {"type": "game_chat", "from": username, "msg": text})
-                    else:
-                        send_msg(conn, {"type": "error", "msg": "Invalid action during a match."})
-
-                elif state == "viewing":
-                    if mtype != "game_chat" or not game:
-                        send_msg(conn, {"type": "error", "msg": "Invalid spectator action."})
-                        continue
-                    text = sanitize_chat(msg.get("msg"))
-                    if not text:
-                        send_msg(conn, {"type": "error", "msg": "Chat message cannot be empty."})
-                        continue
-                    self._send_to_game(
-                        game,
-                        {"type": "game_chat", "from": f"Spectator {username}", "msg": text},
-                    )
-
-        except Exception as exc:
-            print(f"[!] Error with {username or addr}: {exc}")
-        finally:
-            if username:
-                self._disconnect_client(username, conn)
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    def _run_game(self, game):
-        if not game.start_event.wait(READY_TIMEOUT):
-            self._finish_game(game, cancel_reason="Match cancelled: ready-up timed out.")
+    def update_safe_zone(self):
+        if self.mode != "sudden_death" or not self.round_deadline:
             return
+        elapsed = self.time_limit() - self.remaining_time()
+        shrink_steps = max(0, int((elapsed - 15) // 8))
+        max_steps = min(GRID_W // 4, GRID_H // 4) - 2
+        shrink = clamp(shrink_steps, 0, max_steps)
+        zone = [shrink, shrink, GRID_W - shrink * 2, GRID_H - shrink * 2]
+        with self.rlock:
+            if zone != self.safe_zone:
+                self.safe_zone = zone
+                self.add_event("The safe zone shrank.")
 
-        with game.rlock:
-            if game.ended:
-                return
-            game.running = True
-            game.start_time = time.time()
+    def inside_safe_zone(self, cell):
+        if not self.safe_zone:
+            return True
+        x0, y0, w, h = self.safe_zone
+        return x0 <= cell[0] < x0 + w and y0 <= cell[1] < y0 + h
 
-        print(
-            f"[GAME] Started: {game.players[1]['username']} vs "
-            f"{game.players[2]['username']}"
-        )
-        self._broadcast_lobby()
+    def tick_round(self):
+        self.expire_effects()
+        self.update_safe_zone()
 
-        while True:
-            time.sleep(1.0 / TICK_RATE)
-            with game.rlock:
-                if game.ended:
-                    break
-                game_over, winner_pid, time_left = game.update()
-                state_msg = game.get_state(time_left)
+        with self.rlock:
+            old_heads = {pid: tuple(snake["body"][0]) for pid, snake in self.snakes.items()}
+            old_tails = {pid: tuple(snake["body"][-1]) for pid, snake in self.snakes.items()}
+            moves = {}
+            frozen_pids = set()
+            for pid, snake in self.snakes.items():
+                if not snake["alive"]:
+                    moves[pid] = old_heads[pid]
+                    continue
+                if "freeze" in snake["effects"]:
+                    frozen_pids.add(pid)
+                    moves[pid] = old_heads[pid]
+                    continue
+                direction = snake["next_dir"]
+                if OPPOSITE[direction] != snake["dir"]:
+                    snake["dir"] = direction
+                dx, dy = DIRS[snake["dir"]]
+                hx, hy = old_heads[pid]
+                moves[pid] = ((hx + dx) % GRID_W, (hy + dy) % GRID_H)
 
-            self._send_to_game(game, state_msg)
+            for pid, snake in self.snakes.items():
+                if not snake["alive"]:
+                    continue
+                if pid in frozen_pids:
+                    continue
+                new_head = moves[pid]
+                body = [new_head] + list(snake["body"])
+                if snake["grow"] > 0:
+                    snake["grow"] -= 1
+                else:
+                    body.pop()
+                snake["body"] = body
 
-            if game_over:
-                winner_name = "TIE"
-                if winner_pid in game.players:
-                    winner_name = game.players[winner_pid]["username"]
-                print(f"[GAME] Over - winner: {winner_name}")
-                self._finish_game(game, winner_pid=winner_pid)
-                break
+            pie_hits = {}
+            for pid, snake in self.snakes.items():
+                if not snake["alive"]:
+                    continue
+                head = tuple(snake["body"][0])
+                for pie in list(self.pies):
+                    if tuple(pie["pos"]) == head:
+                        pie_hits[pid] = pie
+                        self.pies.remove(pie)
+                        break
+
+            power_hits = {}
+            for pid, snake in self.snakes.items():
+                if not snake["alive"]:
+                    continue
+                head = tuple(snake["body"][0])
+                for powerup in list(self.powerups):
+                    if tuple(powerup["pos"]) == head:
+                        power_hits[pid] = powerup
+                        self.powerups.remove(powerup)
+                        break
+
+            damage_events = {"1": [], "2": []}
+            p1_head = tuple(self.snakes["1"]["body"][0])
+            p2_head = tuple(self.snakes["2"]["body"][0])
+            p1_old = old_heads["1"]
+            p2_old = old_heads["2"]
+            p1_swap = p1_head == p2_old and p2_head == p1_old
+            head_same = p1_head == p2_head
+
+            if head_same or p1_swap:
+                if self.mode == "sudden_death":
+                    damage_events["1"].append((999, "Snake Clash"))
+                    damage_events["2"].append((999, "Snake Clash"))
+                else:
+                    damage_events["1"].append((40, "Snake Clash"))
+                    damage_events["2"].append((40, "Snake Clash"))
+            else:
+                if p1_head in [tuple(cell) for cell in self.snakes["2"]["body"][1:]]:
+                    damage_events["1"].append((999 if self.mode == "sudden_death" else 35, "Enemy Body"))
+                if p2_head in [tuple(cell) for cell in self.snakes["1"]["body"][1:]]:
+                    damage_events["2"].append((999 if self.mode == "sudden_death" else 35, "Enemy Body"))
+
+            for pid, snake in self.snakes.items():
+                if not snake["alive"]:
+                    continue
+                head = tuple(snake["body"][0])
+                if head in self.obstacles:
+                    damage_events[pid].append((25, "Obstacle"))
+                if head in [tuple(cell) for cell in snake["body"][1:]]:
+                    damage_events[pid].append((30, "Own Body"))
+                if self.mode == "sudden_death" and not self.inside_safe_zone(head):
+                    damage_events[pid].append((40, "Safe Zone"))
+
+            for pid in ("1", "2"):
+                if pie_hits.get(pid):
+                    pie = pie_hits[pid]
+                    if pie["kind"] == "poison":
+                        snake = self.snakes[pid]
+                        mult = 2 if "double" in snake["effects"] else 1
+                        damage_events[pid].append((20 * mult, "Poison Pie"))
+
+            for pid in ("1", "2"):
+                if not self.snakes[pid]["alive"]:
+                    continue
+                if damage_events[pid]:
+                    amount, reason = sorted(damage_events[pid], key=lambda item: (-item[0], item[1]))[0]
+                    if amount >= 999:
+                        self.snakes[pid]["health"] = 0
+                        self.snakes[pid]["alive"] = False
+                        self.add_event(f"{self.players[int(pid)]} was eliminated by {reason.lower()}.")
+                    else:
+                        self.apply_damage(pid, amount, reason)
+
+            for pid in ("1", "2"):
+                snake = self.snakes[pid]
+                if not snake["alive"]:
+                    continue
+                pie = pie_hits.get(pid)
+                if pie and pie["kind"] != "poison":
+                    self.consume_pie(pid, pie)
+                powerup = power_hits.get(pid)
+                if powerup:
+                    self.consume_powerup(pid, powerup)
+
+            for pid in ("1", "2"):
+                snake = self.snakes[pid]
+                if snake["alive"] and snake["health"] <= 0:
+                    snake["alive"] = False
+
+            if now() >= self.next_pie_time and len(self.pies) < 5:
+                self.next_pie_time = now() + 4.0
+                self.spawn_pie()
+            if self.mode != "sudden_death" and now() >= self.next_powerup_time and not self.powerups:
+                self.next_powerup_time = now() + random.uniform(9.0, 12.0)
+                self.spawn_powerup()
+
+            alive = [pid for pid, snake in self.snakes.items() if snake["alive"]]
+            if len(alive) == 2 and self.remaining_time() > 0:
+                return None
+
+            if self.remaining_time() <= 0 and len(alive) == 2:
+                hp1 = self.snakes["1"]["health"]
+                hp2 = self.snakes["2"]["health"]
+                if hp1 > hp2:
+                    return self.players[1], "Time"
+                if hp2 > hp1:
+                    return self.players[2], "Time"
+                return "TIE", "Time"
+            if len(alive) == 1:
+                return self.players[int(alive[0])], "Elimination"
+            if len(alive) == 0:
+                return "TIE", "Double KO"
+            return None
+
+    def wait_for_ready(self):
+        deadline = now() + CUSTOMIZE_TIMEOUT
+        while not self.stop_event.is_set():
+            with self.rlock:
+                p1_ready = self.ready[self.players[1]]
+                p2_ready = self.ready[self.players[2]]
+                winner = self.forfeit
+            if winner:
+                username, reason = winner
+                self.cancel_match(f"{username} left before the round started - match cancelled.")
+                return False
+            if p1_ready and p2_ready:
+                return True
+            if now() >= deadline:
+                self.cancel_match("Ready timeout - match cancelled.")
+                return False
+            time.sleep(0.1)
+        return False
+
+    def send_round_prepare(self):
+        with self.server.lock:
+            for pid in (1, 2):
+                client = self.server.clients.get(self.players[pid])
+                if client:
+                    client.state = "CUSTOMIZE"
+        with self.rlock:
+            payload = {
+                "type": "round_prepare" if self.round_number > 1 else "game_start",
+                "game_id": self.id,
+                "mode": self.mode,
+                "grid_w": GRID_W,
+                "grid_h": GRID_H,
+                "selected_map": self.selected_map,
+                "map_votes": dict(self.map_votes),
+                "round_number": self.round_number,
+                "target_wins": self.target_wins,
+                "round_wins": dict(self.round_wins),
+                "opponent_names": {
+                    self.players[1]: self.players[2],
+                    self.players[2]: self.players[1],
+                },
+            }
+            viewer_payload = {
+                "type": "watch_ok" if self.round_number == 1 else "round_prepare",
+                "game_id": self.id,
+                "mode": self.mode,
+                "grid_w": GRID_W,
+                "grid_h": GRID_H,
+                "selected_map": self.selected_map,
+                "map_votes": dict(self.map_votes),
+                "round_number": self.round_number,
+                "target_wins": self.target_wins,
+                "round_wins": dict(self.round_wins),
+                "player1": self.players[1],
+                "player2": self.players[2],
+            }
+            viewers = list(self.viewers)
+        for pid in (1, 2):
+            client = self.server.get_client(self.players[pid])
+            if client is None:
+                continue
+            data = dict(payload)
+            data["player_id"] = pid
+            data["opponent"] = self.players[2 if pid == 1 else 1]
+            client.send(data)
+        for uname in viewers:
+            client = self.server.get_client(uname)
+            if client:
+                client.send(viewer_payload)
+
+    def start_countdown(self):
+        with self.rlock:
+            self.phase = "COUNTDOWN"
+            self.countdown_deadline = now() + 3.0
+        self.broadcast({
+            "type": "countdown_start",
+            "game_id": self.id,
+            "seconds": 3,
+            "round_number": self.round_number,
+            "mode": self.mode,
+            "selected_map": self.selected_map,
+        })
+        while not self.stop_event.is_set() and now() < self.countdown_deadline:
+            with self.rlock:
+                if self.forfeit:
+                    username, reason = self.forfeit
+                    self.cancel_match(f"{username} left before the round started - match cancelled.")
+                    return False
+            time.sleep(0.05)
+        return not self.stop_event.is_set()
+
+    def run_round(self):
+        with self.rlock:
+            self.phase = "ACTIVE"
+            self.round_deadline = now() + self.time_limit()
+        with self.server.lock:
+            for pid in (1, 2):
+                client = self.server.clients.get(self.players[pid])
+                if client:
+                    client.state = "GAME"
+        self.broadcast({"type": "game_begin", "game_id": self.id, "round_number": self.round_number})
+        frame = 1.0 / TICK_RATE
+        while not self.stop_event.is_set():
+            with self.rlock:
+                if self.forfeit:
+                    loser, reason = self.forfeit
+                    winner = self.players[1] if loser == self.players[2] else self.players[2]
+                    return winner, reason
+            result = self.tick_round()
+            self.broadcast(self.serialize_state())
+            if result:
+                return result
+            time.sleep(frame)
+        return None
+
+    def finish_match(self, winner, reason):
+        with self.rlock:
+            self.phase = "FINISHED"
+            self.final_winner = winner
+            self.final_reason = reason
+            self.stop_event.set()
+
+    def cancel_match(self, message):
+        with self.rlock:
+            self.phase = "CANCELLED"
+            self.final_reason = message
+            self.stop_event.set()
+        self.broadcast({"type": "match_cancelled", "msg": message})
+
+    def handle_round_result(self, result):
+        if not result:
+            return False
+        winner, reason = result
+        if winner != "TIE":
+            with self.rlock:
+                self.round_wins[winner] += 1
+        self.broadcast({
+            "type": "round_over",
+            "winner": winner,
+            "reason": reason,
+            "round_number": self.round_number,
+            "round_wins": dict(self.round_wins),
+            "target_wins": self.target_wins,
+        })
+        if reason == "Disconnect":
+            self.finish_match(winner, reason)
+            return False
+        if self.mode != "best_of_3":
+            self.finish_match(winner, reason)
+            return False
+        with self.rlock:
+            if winner != "TIE" and self.round_wins[winner] >= self.target_wins:
+                self.finish_match(winner, "Match")
+                return False
+            self.round_number += 1
+            self.ready = {self.players[1]: False, self.players[2]: False}
+            self.map_votes = {self.players[1]: self.selected_map, self.players[2]: self.selected_map}
+            self.phase = "ROUND_OVER"
+        time.sleep(ROUND_TRANSITION)
+        return True
+
+    def send_final_messages(self):
+        payload = {
+            "type": "game_over",
+            "game_id": self.id,
+            "winner": self.final_winner or "TIE",
+            "reason": self.final_reason,
+            "scores": self.player_summary(),
+            "mode": self.mode,
+            "round_wins": dict(self.round_wins),
+            "target_wins": self.target_wins,
+            "round_number": self.round_number,
+        }
+        self.broadcast(payload)
 
     def run(self):
-        print("[SERVER] Waiting for connections...\n")
+        keep_running = True
+        while keep_running and not self.stop_event.is_set():
+            self.reset_round_state()
+            self.send_round_prepare()
+            self.broadcast_customize_update()
+            if not self.wait_for_ready():
+                break
+            self.resolve_map()
+            self.broadcast_customize_update()
+            if not self.start_countdown():
+                break
+            result = self.run_round()
+            keep_running = self.handle_round_result(result)
+        if self.phase not in ("CANCELLED",):
+            if self.final_winner is None and self.final_reason and self.phase != "CANCELLED":
+                self.final_winner = "TIE"
+            if self.phase != "CANCELLED":
+                self.send_final_messages()
+        self.server.finish_game(self)
+
+
+class ArenaServer:
+    def __init__(self, host=HOST, port=PORT):
+        self.host = host
+        self.port = port
+        self.lock = threading.RLock()
+        self.sock = None
+        self.clients = {}
+        self.active_games = {}
+        self.pending_by_target = {}
+        self.pending_by_challenger = {}
+        self.cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
+        self.cleanup_thread.start()
+
+    def _cleanup_loop(self):
+        while True:
+            time.sleep(1)
+            self.cleanup_expired_challenges()
+
+    def get_client(self, username):
+        with self.lock:
+            return self.clients.get(username)
+
+    def send_to(self, username, payload):
+        client = self.get_client(username)
+        if not client:
+            return False
+        if not client.send(payload):
+            self.handle_disconnect(username)
+            return False
+        return True
+
+    def lobby_snapshot(self):
+        with self.lock:
+            players = [name for name, client in self.clients.items() if client.state == "LOBBY"]
+            viewing = [name for name, client in self.clients.items() if client.state == "WATCHING"]
+            games = []
+            for game in self.active_games.values():
+                with game.rlock:
+                    if game.phase in ("FINISHED", "CANCELLED"):
+                        continue
+                    games.append({
+                        "game_id": game.id,
+                        "player1": game.players[1],
+                        "player2": game.players[2],
+                        "viewers": len(game.viewers),
+                        "mode": game.mode,
+                        "map_id": game.selected_map or game.map_votes.get(game.players[1]),
+                    })
+            recipients = [client for client in self.clients.values() if client.state == "LOBBY"]
+        payload = {"type": "lobby_update", "players": players, "viewing": viewing, "games": games}
+        failures = []
+        for client in recipients:
+            if not client.send(payload):
+                failures.append(client.username)
+        for username in failures:
+            self.handle_disconnect(username)
+
+    def cleanup_pending_for(self, username, send_notice=True, reason="Challenge cancelled."):
+        notices = []
+        with self.lock:
+            outgoing = self.pending_by_challenger.pop(username, None)
+            if outgoing:
+                self.pending_by_target.pop(outgoing.target, None)
+                notices.append((outgoing.challenger, {
+                    "type": "challenge_cancelled",
+                    "from": outgoing.challenger,
+                    "msg": reason,
+                }))
+                notices.append((outgoing.target, {
+                    "type": "challenge_cancelled",
+                    "from": outgoing.challenger,
+                    "msg": reason,
+                }))
+            incoming = self.pending_by_target.pop(username, None)
+            if incoming:
+                self.pending_by_challenger.pop(incoming.challenger, None)
+                notices.append((incoming.target, {
+                    "type": "challenge_cancelled",
+                    "from": incoming.challenger,
+                    "msg": reason,
+                }))
+                notices.append((incoming.challenger, {
+                    "type": "challenge_cancelled",
+                    "from": incoming.challenger,
+                    "msg": reason,
+                }))
+        if send_notice:
+            for target, payload in notices:
+                self.send_to(target, payload)
+
+    def cleanup_expired_challenges(self):
+        expired = []
+        with self.lock:
+            for challenger, challenge in self.pending_by_challenger.items():
+                if now() - challenge.created_at > 10:
+                    expired.append(challenger)
+        for challenger in expired:
+            self.cleanup_pending_for(challenger, reason="Challenge timed out.")
+
+    def register_username(self, client, username):
+        username = valid_username(username)
+        if not username:
+            client.send({"type": "error", "msg": "Username must be 2-20 chars using letters, numbers, _ or -."})
+            return
+        reply = None
+        with self.lock:
+            if username in self.clients:
+                reply = {"type": "username_taken"}
+            else:
+                client.username = username
+                client.state = "LOBBY"
+                self.clients[username] = client
+                reply = {"type": "username_ok", "username": username}
+        client.send(reply)
+        if reply["type"] == "username_ok":
+            self.lobby_snapshot()
+
+    def create_challenge(self, client, target, mode, map_preference):
+        target = clean_text(target, 20)
+        mode = mode if mode in VALID_MODES else None
+        map_preference = map_preference if map_preference in VALID_MAPS else None
+        if not mode or not map_preference:
+            client.send({"type": "error", "msg": "Invalid mode or map selection."})
+            return
+        error = None
+        challenge = None
+        with self.lock:
+            if client.state != "LOBBY":
+                error = "You can only challenge from the lobby."
+            else:
+                target_client = self.clients.get(target)
+                if not target_client or target_client.state != "LOBBY":
+                    error = "That player is no longer available."
+                elif target == client.username:
+                    error = "You cannot challenge yourself."
+                elif client.username in self.pending_by_challenger or client.username in self.pending_by_target:
+                    error = "Resolve your existing challenge first."
+                elif target in self.pending_by_challenger or target in self.pending_by_target:
+                    error = "That player already has a pending challenge."
+                else:
+                    challenge = PendingChallenge(client.username, target, mode, map_preference)
+                    self.pending_by_challenger[client.username] = challenge
+                    self.pending_by_target[target] = challenge
+        if error:
+            client.send({"type": "error", "msg": error})
+            return
+        delivered = self.send_to(target, {
+            "type": "challenge_request",
+            "from": client.username,
+            "mode": mode,
+            "map_preference": map_preference,
+        })
+        if delivered:
+            client.send({"type": "challenge_sent", "target": target, "mode": mode, "map_preference": map_preference})
+        else:
+            self.cleanup_pending_for(client.username, send_notice=False)
+            client.send({"type": "error", "msg": "Challenge could not be delivered."})
+
+    def answer_challenge(self, client, challenger, accepted):
+        challenger = clean_text(challenger, 20)
+        error = None
+        cancel_payload = None
+        with self.lock:
+            if client.state != "LOBBY":
+                error = "Only lobby players can accept challenges."
+                challenge = None
+            else:
+                challenge = self.pending_by_target.get(client.username)
+                if not challenge or challenge.challenger != challenger:
+                    error = "That challenge is no longer valid."
+                else:
+                    challenger_client = self.clients.get(challenger)
+                    if not challenger_client or challenger_client.state != "LOBBY":
+                        self.pending_by_target.pop(client.username, None)
+                        self.pending_by_challenger.pop(challenger, None)
+                        cancel_payload = {
+                            "type": "challenge_cancelled",
+                            "from": challenger,
+                            "msg": "Challenger is no longer available.",
+                        }
+                    else:
+                        self.pending_by_target.pop(client.username, None)
+                        self.pending_by_challenger.pop(challenger, None)
+        if error:
+            client.send({"type": "error", "msg": error})
+            return
+        if cancel_payload:
+            client.send(cancel_payload)
+            return
+
+        if not accepted:
+            self.send_to(challenger, {"type": "challenge_declined", "from": client.username})
+            return
+
+        self.start_game(challenge.challenger, challenge.target, challenge.mode, challenge.map_preference)
+
+    def start_game(self, username1, username2, mode, challenger_map):
+        with self.lock:
+            player1 = self.clients.get(username1)
+            player2 = self.clients.get(username2)
+            if not player1 or not player2 or player1.state != "LOBBY" or player2.state != "LOBBY":
+                return
+            game = GameSession(self, username1, username2, mode, challenger_map)
+            self.active_games[game.id] = game
+            player1.state = "CUSTOMIZE"
+            player2.state = "CUSTOMIZE"
+            player1.game_id = game.id
+            player2.game_id = game.id
+        game.start()
+        self.lobby_snapshot()
+
+    def watch_game(self, client, game_id):
+        error = None
+        with self.lock:
+            if client.state != "LOBBY":
+                error = "You can only spectate from the lobby."
+                game = None
+            else:
+                game = self.active_games.get(game_id)
+        if error:
+            client.send({"type": "error", "msg": error})
+            return
+        if not game:
+            client.send({"type": "error", "msg": "That game is no longer running."})
+            return
+        game.add_viewer(client.username)
+        with self.lock:
+            client.state = "WATCHING"
+            client.watching_game_id = game_id
+        with game.rlock:
+            selected_map = game.selected_map
+            round_number = game.round_number
+            round_wins = dict(game.round_wins)
+            target_wins = game.target_wins
+            mode = game.mode
+            player1 = game.players[1]
+            player2 = game.players[2]
+        client.send({
+            "type": "watch_ok",
+            "game_id": game_id,
+            "grid_w": GRID_W,
+            "grid_h": GRID_H,
+            "mode": mode,
+            "selected_map": selected_map,
+            "round_number": round_number,
+            "round_wins": round_wins,
+            "target_wins": target_wins,
+            "player1": player1,
+            "player2": player2,
+        })
+        snapshot = game.serialize_state()
+        client.send(snapshot)
+        self.lobby_snapshot()
+
+    def finish_game(self, game):
+        players_to_reset = []
+        viewers_to_reset = []
+        with self.lock:
+            self.active_games.pop(game.id, None)
+            for pid in (1, 2):
+                username = game.players[pid]
+                client = self.clients.get(username)
+                if client and client.game_id == game.id:
+                    client.game_id = None
+                    client.state = "LOBBY"
+                    players_to_reset.append(client)
+            for username in list(game.viewers):
+                client = self.clients.get(username)
+                if client and client.watching_game_id == game.id:
+                    client.watching_game_id = None
+                    client.state = "LOBBY"
+                    viewers_to_reset.append(client)
+        self.lobby_snapshot()
+
+    def game_for_user(self, client):
+        with self.lock:
+            game_id = client.game_id or client.watching_game_id
+            if not game_id:
+                return None
+            return self.active_games.get(game_id)
+
+    def send_lobby_chat(self, client, text):
+        if client.state != "LOBBY":
+            client.send({"type": "error", "msg": "Lobby chat is only available in the lobby."})
+            return
+        msg = clean_text(text, 80)
+        if not msg:
+            return
+        with self.lock:
+            recipients = [c for c in self.clients.values() if c.state == "LOBBY"]
+        failures = []
+        payload = {"type": "lobby_chat", "from": client.username, "msg": msg}
+        for recipient in recipients:
+            if not recipient.send(payload):
+                failures.append(recipient.username)
+        for username in failures:
+            self.handle_disconnect(username)
+
+    def send_game_chat(self, client, text):
+        msg = clean_text(text, 80)
+        if not msg:
+            return
+        game = self.game_for_user(client)
+        if not game:
+            client.send({"type": "error", "msg": "No active game chat available."})
+            return
+        game.broadcast({"type": "game_chat", "from": client.username, "msg": msg})
+
+    def handle_disconnect(self, username):
+        if not username:
+            return
+        with self.lock:
+            client = self.clients.pop(username, None)
+            if not client:
+                return
+            game = self.active_games.get(client.game_id) if client.game_id else None
+            watch_game = self.active_games.get(client.watching_game_id) if client.watching_game_id else None
+        self.cleanup_pending_for(username, send_notice=True, reason="Challenge cancelled - player disconnected.")
+        if game:
+            game.mark_forfeit(username, "Disconnect")
+        if watch_game:
+            watch_game.remove_viewer(username)
+        client.close()
+        self.lobby_snapshot()
+
+    def handle_message(self, client, payload):
+        if not isinstance(payload, dict):
+            client.send({"type": "error", "msg": "Malformed message."})
+            return
+        msg_type = payload.get("type")
+        if msg_type == "username":
+            if client.username:
+                client.send({"type": "error", "msg": "Username already set."})
+                return
+            self.register_username(client, payload.get("username", ""))
+            return
+
+        if not client.username:
+            client.send({"type": "error", "msg": "Set a username first."})
+            return
+
+        if msg_type == "challenge":
+            self.create_challenge(client, payload.get("target", ""), payload.get("mode"), payload.get("map_preference"))
+        elif msg_type == "challenge_response":
+            self.answer_challenge(client, payload.get("from", ""), bool(payload.get("accepted")))
+        elif msg_type == "watch":
+            self.watch_game(client, payload.get("game_id", ""))
+        elif msg_type == "lobby_chat":
+            self.send_lobby_chat(client, payload.get("msg", ""))
+        elif msg_type == "game_chat":
+            self.send_game_chat(client, payload.get("msg", ""))
+        elif msg_type == "move":
+            game = self.game_for_user(client)
+            if not game or client.state != "GAME":
+                return
+            game.queue_move(client.username, payload.get("direction"))
+        elif msg_type == "customize_choice":
+            game = self.game_for_user(client)
+            if not game:
+                return
+            color = payload.get("color")
+            if not (isinstance(color, list) and len(color) >= 3):
+                color = None
+            map_vote = payload.get("map_vote")
+            if map_vote not in VALID_MAPS:
+                map_vote = None
+            game.set_customize(client.username, color=color, map_vote=map_vote)
+        elif msg_type == "player_ready":
+            game = self.game_for_user(client)
+            if not game:
+                return
+            color = payload.get("color")
+            if not (isinstance(color, list) and len(color) >= 3):
+                color = None
+            map_vote = payload.get("map_vote")
+            if map_vote not in VALID_MAPS:
+                map_vote = None
+            if client.state in ("CUSTOMIZE", "GAME"):
+                game.set_customize(client.username, color=color, map_vote=map_vote, ready=True)
+        elif msg_type == "leave_watch":
+            game = self.game_for_user(client)
+            if game and client.watching_game_id:
+                game.remove_viewer(client.username)
+                with self.lock:
+                    client.watching_game_id = None
+                    client.state = "LOBBY"
+                self.lobby_snapshot()
+        else:
+            client.send({"type": "error", "msg": "Unknown message type."})
+
+    def client_thread(self, conn, addr):
+        client = ClientConn(conn, addr)
+        buffer = ""
+        try:
+            while not client.closed:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buffer += chunk.decode("utf-8", errors="ignore")
+                while "\n" in buffer:
+                    raw, buffer = buffer.split("\n", 1)
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        payload = json.loads(raw)
+                    except json.JSONDecodeError:
+                        client.send({"type": "error", "msg": "Malformed JSON."})
+                        continue
+                    self.handle_message(client, payload)
+        except Exception:
+            pass
+        finally:
+            username = client.username
+            if username:
+                self.handle_disconnect(username)
+            else:
+                client.close()
+
+    def serve_forever(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self.host, self.port))
+        self.sock.listen()
+        print(f"Python Arena server listening on {self.host}:{self.port}")
+        try:
+            lan_ip = socket.gethostbyname(socket.gethostname())
+            print(f"Players on your network should connect to {lan_ip}:{self.port}")
+        except Exception:
+            pass
         while True:
             conn, addr = self.sock.accept()
-            thread = threading.Thread(
-                target=self.handle_client,
-                args=(conn, addr),
-                daemon=True,
-            )
-            thread.start()
-            print(
-                f"[SERVER] Connection from {addr} | active threads: "
-                f"{threading.active_count() - 1}"
-            )
+            threading.Thread(target=self.client_thread, args=(conn, addr), daemon=True).start()
 
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
-    Server(port).run()
+    ArenaServer().serve_forever()

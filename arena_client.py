@@ -32,6 +32,51 @@ SNAKE_COLORS = [
 ]
 
 DIR_SYMBOLS = {"UP": "^", "DOWN": "v", "LEFT": "<", "RIGHT": ">"}
+MODE_ORDER = ["base", "sudden_death", "fog_of_war", "best_of_3"]
+MODE_LABELS = {
+    "base": "Base",
+    "sudden_death": "Sudden Death",
+    "fog_of_war": "Fog of War",
+    "best_of_3": "Best of 3",
+}
+MODE_BLURBS = {
+    "base": "Standard one-round match with power-ups enabled.",
+    "sudden_death": "Short round, no power-ups, shrinking safe zone, snake clashes kill instantly.",
+    "fog_of_war": "Standard round with limited vision around each snake head.",
+    "best_of_3": "First player to win two rounds takes the match.",
+}
+MAP_ORDER = ["ember", "frost", "vault"]
+MAP_LABELS = {
+    "ember": "Ember Forge",
+    "frost": "Frost Lattice",
+    "vault": "Vault Rings",
+}
+MAP_THEMES = {
+    "ember": {
+        "board_bg": (33, 22, 18),
+        "grid": (74, 44, 34),
+        "obstacle": (124, 72, 43),
+        "obstacle_x": (78, 38, 18),
+        "safe_zone": (255, 120, 80),
+        "accent": (255, 170, 90),
+    },
+    "frost": {
+        "board_bg": (19, 29, 41),
+        "grid": (54, 82, 112),
+        "obstacle": (93, 138, 176),
+        "obstacle_x": (50, 81, 108),
+        "safe_zone": (160, 225, 255),
+        "accent": (150, 220, 255),
+    },
+    "vault": {
+        "board_bg": (24, 23, 35),
+        "grid": (58, 55, 84),
+        "obstacle": (126, 100, 155),
+        "obstacle_x": (77, 53, 100),
+        "safe_zone": (220, 175, 255),
+        "accent": (205, 160, 255),
+    },
+}
 
 CELL        = 22           # pixels per grid cell
 GRID_W      = 36           # default; updated from server
@@ -331,7 +376,8 @@ class ArenaClient:
         self.lobby_players    = []
         self.lobby_games      = []        # list of {"game_id", "player1", "player2", "viewers"}
         self.lobby_viewing    = []        # usernames currently spectating any game
-        self.pending_from     = None      # challenger username
+        self.pending_challenge = None     # incoming challenge details
+        self.challenge_setup   = None     # outgoing challenge draft
         self.game_state       = None      # latest game_state dict from server
         self.prev_game_state  = None
         self.game_over_data   = None
@@ -339,6 +385,16 @@ class ArenaClient:
         self.error_msg        = ""
         self.error_timer      = 0
         self.board_animations = []
+        self.selected_mode    = "base"
+        self.map_vote         = "ember"
+        self.map_votes        = {}
+        self.selected_map     = None
+        self.customize_info   = {}
+        self.ready_state      = {}
+        self.round_number     = 1
+        self.round_wins       = {}
+        self.target_wins      = 1
+        self.countdown_end_ms = 0
 
         # Customization
         self.custom_color    = [0, 210, 90]   # chosen snake color (RGB list)
@@ -630,10 +686,21 @@ class ArenaClient:
         self.game_state = None
         self.game_over_data = None
         self.chat_log = []
-        self.pending_from = None
+        self.pending_challenge = None
+        self.challenge_setup = None
         self.customize_ready = False
         self.binding_slot = None
         self.custom_color = [0, 210, 90]
+        self.selected_mode = "base"
+        self.map_vote = "ember"
+        self.map_votes = {}
+        self.selected_map = None
+        self.customize_info = {}
+        self.ready_state = {}
+        self.round_number = 1
+        self.round_wins = {}
+        self.target_wins = 1
+        self.countdown_end_ms = 0
         self.gw = GRID_W
         self.gh = GRID_H
         self.board_animations = []
@@ -665,7 +732,7 @@ class ArenaClient:
         if msg:
             self._set_error(msg)
 
-    # ── Networking ────────────────────────────
+    # Networking
     def _send(self, msg: dict):
         if not self.conn:
             return False
@@ -699,15 +766,16 @@ class ArenaClient:
     def _process_queue(self):
         while not self.mq.empty():
             msg = self.mq.get()
-            t   = msg.get("type")
+            t = msg.get("type")
 
             if t == "_disconnected":
                 self._reset_to_connect("Disconnected from server.")
 
             elif t == "username_ok":
                 self.username = msg["username"]
-                self.state    = "LOBBY"
-                self.pending_from = None
+                self.state = "LOBBY"
+                self.pending_challenge = None
+                self.challenge_setup = None
                 self.error_msg = ""
                 self.error_timer = 0
                 self._apply_window_size()
@@ -716,55 +784,127 @@ class ArenaClient:
                 self._set_error("Username already taken - try another.")
 
             elif t == "lobby_update":
-                self.lobby_players = [p for p in msg.get("players", [])
-                                      if p != self.username]
-                self.lobby_games   = msg.get("games", [])
-                self.lobby_viewing = [v for v in msg.get("viewing", [])
-                                      if v != self.username]
-                if self.pending_from and self.pending_from not in self.lobby_players:
-                    self.pending_from = None
+                self.lobby_players = [p for p in msg.get("players", []) if p != self.username]
+                self.lobby_games = msg.get("games", [])
+                self.lobby_viewing = [v for v in msg.get("viewing", []) if v != self.username]
+                if (self.pending_challenge
+                        and self.pending_challenge.get("from") not in self.lobby_players):
+                    self.pending_challenge = None
 
             elif t == "challenge_request":
                 if self.state == "LOBBY":
-                    self.pending_from = msg.get("from")
+                    self.pending_challenge = {
+                        "from": msg.get("from", ""),
+                        "mode": msg.get("mode", "base"),
+                        "map_preference": msg.get("map_preference", "ember"),
+                    }
 
             elif t == "challenge_sent":
-                self._set_error(f"Challenge sent to {msg.get('target')} - waiting...")
+                self.challenge_setup = None
+                mode = MODE_LABELS.get(msg.get("mode"), msg.get("mode", ""))
+                map_name = MAP_LABELS.get(msg.get("map_preference"), msg.get("map_preference", ""))
+                self._set_error(f"Challenge sent to {msg.get('target')} - {mode}, {map_name}.")
 
             elif t == "challenge_declined":
                 self._set_error(f"{msg.get('from')} declined your challenge.")
 
             elif t == "challenge_cancelled":
-                if self.pending_from == msg.get("from"):
-                    self.pending_from = None
+                if self.pending_challenge and self.pending_challenge.get("from") == msg.get("from"):
+                    self.pending_challenge = None
                 self._set_error(msg.get("msg", "Challenge cancelled."))
 
             elif t == "game_start":
                 self._clear_game_context()
-                self.player_id       = msg["player_id"]
-                self.game_id         = msg.get("game_id", "")
-                self.opponent        = msg.get("opponent", "")
-                self.gw              = msg.get("grid_w", GRID_W)
-                self.gh              = msg.get("grid_h", GRID_H)
-                self.state           = "CUSTOMIZE"
-                self.error_msg       = ""
-                self.error_timer     = 0
+                self.player_id = msg["player_id"]
+                self.game_id = msg.get("game_id", "")
+                self.opponent = msg.get("opponent", "")
+                self.gw = msg.get("grid_w", GRID_W)
+                self.gh = msg.get("grid_h", GRID_H)
+                self.selected_mode = msg.get("mode", "base")
+                self.selected_map = msg.get("selected_map")
+                self.map_votes = msg.get("map_votes", {})
+                self.map_vote = self.selected_map or self.map_votes.get(self.username, "ember")
+                self.round_number = msg.get("round_number", 1)
+                self.round_wins = msg.get("round_wins", {})
+                self.target_wins = msg.get("target_wins", 1)
+                self.ready_state = {}
+                self.state = "CUSTOMIZE"
+                self.error_msg = ""
+                self.error_timer = 0
                 self.customize_ready = False
-                self.binding_slot    = None
-                self.custom_color    = ([0, 210, 90] if self.player_id == 1
-                                        else [30, 140, 255])
+                self.binding_slot = None
+                self.custom_color = ([0, 210, 90] if self.player_id == 1 else [30, 140, 255])
                 self._apply_window_size()
 
+            elif t == "round_prepare":
+                if self.state == "WATCHING" and "player_id" not in msg:
+                    self.game_state = None
+                    self.prev_game_state = None
+                    self.selected_mode = msg.get("mode", self.selected_mode)
+                    self.selected_map = msg.get("selected_map", self.selected_map)
+                    self.map_votes = msg.get("map_votes", self.map_votes)
+                    self.round_number = msg.get("round_number", self.round_number)
+                    self.round_wins = msg.get("round_wins", self.round_wins)
+                    self.target_wins = msg.get("target_wins", self.target_wins)
+                    self.countdown_end_ms = 0
+                    continue
+                self.game_state = None
+                self.prev_game_state = None
+                self.player_id = msg["player_id"]
+                self.game_id = msg.get("game_id", self.game_id or "")
+                self.opponent = msg.get("opponent", self.opponent)
+                self.gw = msg.get("grid_w", self.gw)
+                self.gh = msg.get("grid_h", self.gh)
+                self.selected_mode = msg.get("mode", self.selected_mode)
+                self.selected_map = msg.get("selected_map")
+                self.map_votes = msg.get("map_votes", self.map_votes)
+                self.map_vote = self.selected_map or self.map_votes.get(self.username, self.map_vote)
+                self.round_number = msg.get("round_number", self.round_number)
+                self.round_wins = msg.get("round_wins", self.round_wins)
+                self.target_wins = msg.get("target_wins", self.target_wins)
+                self.ready_state = {}
+                self.customize_ready = False
+                self.binding_slot = None
+                self.countdown_end_ms = 0
+                self.state = "CUSTOMIZE"
+                self._apply_window_size()
+
+            elif t == "customize_update":
+                self.selected_mode = msg.get("mode", self.selected_mode)
+                self.selected_map = msg.get("selected_map", self.selected_map)
+                self.round_number = msg.get("round_number", self.round_number)
+                self.round_wins = msg.get("round_wins", self.round_wins)
+                self.target_wins = msg.get("target_wins", self.target_wins)
+                self.map_votes = msg.get("map_votes", {})
+                if self.map_votes.get(self.username):
+                    self.map_vote = self.map_votes[self.username]
+                self.ready_state = msg.get("ready", {})
+                self.customize_info = msg.get("players", {})
+                self.customize_ready = bool(self.ready_state.get(self.username, False))
+
             elif t == "game_begin":
-                if self.state == "CUSTOMIZE":
+                if self.state in ("CUSTOMIZE", "GAME"):
                     self.state = "GAME"
-                    self._apply_window_size()
+                self.countdown_end_ms = 0
+                self._apply_window_size()
+
+            elif t == "countdown_start":
+                self.selected_map = msg.get("selected_map", self.selected_map)
+                seconds = max(1, int(msg.get("seconds", 3)))
+                self.countdown_end_ms = pygame.time.get_ticks() + seconds * 1000
 
             elif t == "watch_ok":
                 self._clear_game_context()
                 self.watching_game_id = msg.get("game_id", "")
-                self.gw    = msg.get("grid_w", GRID_W)
-                self.gh    = msg.get("grid_h", GRID_H)
+                self.gw = msg.get("grid_w", GRID_W)
+                self.gh = msg.get("grid_h", GRID_H)
+                self.selected_mode = msg.get("mode", "base")
+                self.selected_map = msg.get("selected_map")
+                self.map_votes = msg.get("map_votes", {})
+                self.round_number = msg.get("round_number", 1)
+                self.round_wins = msg.get("round_wins", {})
+                self.target_wins = msg.get("target_wins", 1)
+                self.opponent = f"{msg.get('player1', '')} vs {msg.get('player2', '')}"
                 self.state = "WATCHING"
                 self._apply_window_size()
 
@@ -772,6 +912,11 @@ class ArenaClient:
                 if self.state in ("GAME", "WATCHING", "GAME_OVER"):
                     self._maybe_trigger_board_animations(msg)
                     self.game_state = msg
+                    self.selected_mode = msg.get("mode", self.selected_mode)
+                    self.selected_map = msg.get("map_id", self.selected_map)
+                    self.round_number = msg.get("round_number", self.round_number)
+                    self.round_wins = msg.get("round_wins", self.round_wins)
+                    self.target_wins = msg.get("target_wins", self.target_wins)
 
             elif t == "game_over":
                 if self.state == "WATCHING":
@@ -780,9 +925,21 @@ class ArenaClient:
                 elif self.state in ("CUSTOMIZE", "GAME", "GAME_OVER"):
                     self.game_over_data = msg
                     self.state = "GAME_OVER"
+                    self.countdown_end_ms = 0
+
+            elif t == "round_over":
+                self.round_wins = msg.get("round_wins", self.round_wins)
+                self.target_wins = msg.get("target_wins", self.target_wins)
+                winner = msg.get("winner", "TIE")
+                if winner == "TIE":
+                    self._set_error("Round tied - next round preparing.")
+                elif winner == self.username:
+                    self._set_error("You won the round.")
+                else:
+                    self._set_error(f"{winner} won the round.")
 
             elif t in ("game_chat", "lobby_chat"):
-                line = f"{msg.get('from','?')}: {msg.get('msg','')}"
+                line = f"{msg.get('from', '?')}: {msg.get('msg', '')}"
                 self.chat_log.append(line)
                 if len(self.chat_log) > 80:
                     self.chat_log.pop(0)
@@ -797,9 +954,34 @@ class ArenaClient:
         self.error_msg = msg
         self.error_timer = 240 if msg else 0
 
+    def _theme(self):
+        theme = MAP_THEMES.get(self.selected_map or self.map_vote or "ember", {})
+        merged = dict(C)
+        merged.update(theme)
+        return merged
+
+    def _countdown_value(self):
+        if self.countdown_end_ms <= 0:
+            return 0
+        remaining = max(0, self.countdown_end_ms - pygame.time.get_ticks())
+        if remaining <= 0:
+            self.countdown_end_ms = 0
+            return 0
+        return max(1, int(math.ceil(remaining / 1000.0)))
+
+    def _send_customize_choice(self):
+        self._send({
+            "type": "customize_choice",
+            "color": self.custom_color,
+        })
+
     # ── Try to connect to server ──────────────
     def _try_connect(self):
-        ip   = self.ip_input.text.strip() or socket.gethostbyname(socket.gethostname())
+        ip = self.ip_input.text.strip()
+        if not ip:
+            ip = socket.gethostbyname(socket.gethostname())
+        elif ip == "0.0.0.0":
+            ip = "127.0.0.1"
         try:
             port = int(self.port_input.text.strip() or "8000")
         except ValueError:
@@ -820,8 +1002,24 @@ class ArenaClient:
             self._set_error(f"Connection failed: {e}")
 
     # ──────────────────────────────────────────
-    #  DRAW SCREENS
-    # ──────────────────────────────────────────
+    # DRAW SCREENS
+    def _draw_fog_of_war(self, gs, board_x, board_y):
+        if self.selected_mode != "fog_of_war" or self.state != "GAME" or not self.player_id:
+            return
+        snake = gs.get("snakes", {}).get(str(self.player_id))
+        if not snake or not snake.get("body"):
+            return
+        length = len(snake.get("body", []))
+        hx, hy = snake["body"][0]
+        radius_cells = 4.5 + min(6.0, length * 0.28)
+        radius_px = int(radius_cells * CELL)
+        fog = pygame.Surface((self.gw * CELL, self.gh * CELL), pygame.SRCALPHA)
+        fog.fill((0, 0, 0, 215))
+        center = (hx * CELL + CELL // 2, hy * CELL + CELL // 2)
+        pygame.draw.circle(fog, (0, 0, 0, 0), center, radius_px)
+        pygame.draw.circle(fog, (255, 255, 255, 40), center, radius_px, 2)
+        self.screen.blit(fog, (board_x, board_y))
+
     def _draw_connect(self):
         sw, sh = self.screen.get_size()
         self.screen.fill(C["bg"])
@@ -839,10 +1037,13 @@ class ArenaClient:
         self.ip_input.draw(self.screen)
         self.port_input.draw(self.screen)
         self.conn_btn.draw(self.screen)
+        draw_text(self.screen,
+                  "Tip: 0.0.0.0 is for hosting; friends should use the server computer's LAN IP.",
+                  self.f_xs, C["dim"], (sw // 2, 486), "center")
 
         if self.error_msg:
             draw_text(self.screen, self.error_msg, self.f_sm, C["danger"],
-                      (sw//2, 495), "center")
+                      (sw//2, 520), "center")
 
     def _draw_username(self):
         sw, sh = self.screen.get_size()
@@ -865,260 +1066,241 @@ class ArenaClient:
     def _draw_lobby(self):
         sw, sh = self.screen.get_size()
         self.screen.fill(C["bg"])
-
-        # Header bar
         pygame.draw.rect(self.screen, C["panel"], (0, 0, sw, 72))
         pygame.draw.line(self.screen, C["card_border"], (0, 71), (sw, 71))
         draw_text(self.screen, "Python Arena", self.f_lg, C["accent"], (24, 18))
         draw_text(self.screen, f"Logged in as  {self.username}", self.f_sm,
                   C["dim"], (sw - 20, 25), "topright")
-
-        # Section title
         draw_text(self.screen, "Online Players", self.f_md, C["text"], (24, 90))
+        draw_text(self.screen, "Choose mode and map before sending a challenge.",
+                  self.f_xs, C["dim"], (24, 118))
 
-        # Player rows (challengeable + watchers)
-        btn_rects  = {}   # player → challenge button rect
-        all_rows   = ([(p, "lobby")   for p in self.lobby_players] +
-                      [(v, "viewing") for v in self.lobby_viewing])
+        btn_rects = {}
+        all_rows = ([(p, "lobby") for p in self.lobby_players] +
+                    [(v, "viewing") for v in self.lobby_viewing])
         if not all_rows:
             draw_text(self.screen, "No other players online - waiting for opponents...",
-                      self.f_sm, C["dim"], (24, 130))
+                      self.f_sm, C["dim"], (24, 152))
         else:
             for i, (name, role) in enumerate(all_rows[:8]):
-                y    = 122 + i * 62
-                row  = pygame.Rect(24, y, sw - 300, 52)
-                hi   = row.collidepoint(pygame.mouse.get_pos())
-                if hi:
+                y = 146 + i * 62
+                row = pygame.Rect(24, y, sw - 300, 52)
+                if row.collidepoint(pygame.mouse.get_pos()):
                     pygame.draw.rect(self.screen, C["card_hi"], row, border_radius=8)
-                draw_text(self.screen,
-                          ("Player  " if role == "lobby" else "Viewer  ") + name +
-                          ("  - watching" if role == "viewing" else ""),
-                          self.f_sm, C["text"] if role == "lobby" else C["dim"],
+                label = ("Player  " if role == "lobby" else "Viewer  ") + name
+                if role == "viewing":
+                    label += "  - watching"
+                draw_text(self.screen, label, self.f_sm,
+                          C["text"] if role == "lobby" else C["dim"],
                           (row.x + 18, row.y + 15))
                 pygame.draw.line(self.screen, C["card_border"],
                                  (row.x, row.bottom), (row.right, row.bottom), 1)
                 if role == "lobby":
-                    ch_r   = pygame.Rect(row.right - 140, y + 8, 130, 36)
-                    hov_ch = ch_r.collidepoint(pygame.mouse.get_pos())
-                    pygame.draw.rect(self.screen, C["btn_hover"] if hov_ch else C["btn"],
+                    ch_r = pygame.Rect(row.right - 140, y + 8, 130, 36)
+                    pygame.draw.rect(self.screen,
+                                     C["btn_hover"] if ch_r.collidepoint(pygame.mouse.get_pos()) else C["btn"],
                                      ch_r, border_radius=7)
-                    draw_text(self.screen, "Challenge", self.f_xs, C["text"],
-                              ch_r.center, "center")
+                    draw_text(self.screen, "Challenge", self.f_xs, C["text"], ch_r.center, "center")
                     btn_rects[name] = ch_r
 
-        # Live Games panel (right column)
         lg_x = sw - 258
         draw_text(self.screen, "Live Games", self.f_sm, C["text"], (lg_x, 90))
-        watch_btns = {}   # game_id -> Rect
+        watch_btns = {}
         if not self.lobby_games:
-            draw_text(self.screen, "No games in progress",
-                      self.f_xs, C["dim"], (lg_x, 120))
+            draw_text(self.screen, "No games in progress", self.f_xs, C["dim"], (lg_x, 120))
         else:
             for i, ginfo in enumerate(self.lobby_games[:6]):
-                gid      = ginfo["game_id"]
-                label    = f"{ginfo['player1']} vs {ginfo['player2']}"
-                n_view   = ginfo.get("viewers", 0)
-                gy       = 118 + i * 52
-                draw_text(self.screen, label[:22], self.f_xs, C["text"], (lg_x, gy))
-                if n_view:
-                    draw_text(self.screen, f"Viewers {n_view}", self.f_xs, C["dim"],
-                              (lg_x, gy + 18))
-                wrect = pygame.Rect(lg_x + 152, gy - 4, 74, 26)
-                hov_w = wrect.collidepoint(pygame.mouse.get_pos())
+                gid = ginfo["game_id"]
+                gy = 118 + i * 60
+                draw_text(self.screen, f"{ginfo['player1']} vs {ginfo['player2']}"[:22],
+                          self.f_xs, C["text"], (lg_x, gy))
+                draw_text(self.screen,
+                          f"{MODE_LABELS.get(ginfo.get('mode'), 'Base')} - "
+                          f"{MAP_LABELS.get(ginfo.get('map_id'), 'TBD')}",
+                          self.f_xs, C["dim"], (lg_x, gy + 16))
+                if ginfo.get("viewers", 0):
+                    draw_text(self.screen, f"Viewers {ginfo.get('viewers', 0)}", self.f_xs,
+                              C["dim"], (lg_x, gy + 32))
+                wrect = pygame.Rect(lg_x + 152, gy - 2, 74, 26)
                 pygame.draw.rect(self.screen,
-                                 (70, 50, 140) if hov_w else (50, 35, 110),
+                                 (70, 50, 140) if wrect.collidepoint(pygame.mouse.get_pos()) else (50, 35, 110),
                                  wrect, border_radius=6)
-                draw_text(self.screen, "Watch", self.f_xs, C["text"],
-                          wrect.center, "center")
+                draw_text(self.screen, "Watch", self.f_xs, C["text"], wrect.center, "center")
                 watch_btns[gid] = wrect
 
-        # Lobby chat panel
         chat_panel = pygame.Rect(24, sh - 200, sw - 48, 180)
-        # Shadow
-        chat_shadow = chat_panel.copy()
-        chat_shadow.x += 3
-        chat_shadow.y += 3
-        pygame.draw.rect(self.screen, (0, 0, 0, 60), chat_shadow, border_radius=10)
+        shadow = chat_panel.copy(); shadow.x += 3; shadow.y += 3
+        pygame.draw.rect(self.screen, (0, 0, 0, 60), shadow, border_radius=10)
         pygame.draw.rect(self.screen, C["panel"], chat_panel, border_radius=10)
         pygame.draw.rect(self.screen, C["card_border"], chat_panel, 1, border_radius=10)
-        draw_text(self.screen, "Lobby Chat", self.f_xs, C["dim"],
-                  (chat_panel.x + 12, chat_panel.y + 8))
-
-        visible = self.chat_log[-6:]
-        for j, line in enumerate(visible):
+        draw_text(self.screen, "Lobby Chat", self.f_xs, C["dim"], (chat_panel.x + 12, chat_panel.y + 8))
+        for j, line in enumerate(self.chat_log[-6:]):
             draw_text(self.screen, line[:80], self.f_xs, C["text"],
                       (chat_panel.x + 12, chat_panel.y + 28 + j * 18))
-
-        # Chat input
-        ci_rect = pygame.Rect(chat_panel.x + 4, chat_panel.bottom - 38,
-                              chat_panel.w - 8, 32)
+        ci_rect = pygame.Rect(chat_panel.x + 4, chat_panel.bottom - 38, chat_panel.w - 8, 32)
         if not hasattr(self, "_lobby_chat_input"):
-            self._lobby_chat_input = TextInput(ci_rect, "Press Enter to chat...",
-                                               self.f_xs, max_len=80)
+            self._lobby_chat_input = TextInput(ci_rect, "Press Enter to chat...", self.f_xs, max_len=80)
         self._lobby_chat_input.rect = ci_rect
-        # Input shadow
-        ci_shadow = ci_rect.copy()
-        ci_shadow.x += 2
-        ci_shadow.y += 2
-        pygame.draw.rect(self.screen, (0, 0, 0, 50), ci_shadow, border_radius=7)
         self._lobby_chat_input.draw(self.screen)
 
-        # Challenge notification popup
         acc_btn = dec_btn = None
-        if self.pending_from:
-            ox, oy, ow, oh = sw//2-220, sh//2-90, 440, 180
-            popup_rect = pygame.Rect(ox, oy, ow, oh)
-            # Shadow
-            popup_shadow = popup_rect.copy()
-            popup_shadow.x += 4
-            popup_shadow.y += 4
-            pygame.draw.rect(self.screen, (0, 0, 0, 80), popup_shadow, border_radius=14)
-            pygame.draw.rect(self.screen, C["panel"],
-                             popup_rect, border_radius=14)
-            pygame.draw.rect(self.screen, C["accent"],
-                             popup_rect, 2,  border_radius=14)
-            draw_text(self.screen,
-                      f"{self.pending_from}  challenged you!",
-                      self.f_md, C["accent"], (sw//2, oy + 35), "center")
-            acc_btn = Button((sw//2 - 130, oy + 90, 115, 42), "Accept",
-                             self.f_sm, C["btn_green"], (50, 180, 70))
-            dec_btn = Button((sw//2 + 15,  oy + 90, 115, 42), "Decline",
-                             self.f_sm, C["btn_red"],   (200, 50, 50))
-            # Button shadows
-            for btn in [acc_btn, dec_btn]:
-                bshadow = btn.rect.copy()
-                bshadow.x += 2
-                bshadow.y += 2
-                pygame.draw.rect(self.screen, (0, 0, 0, 50), bshadow, border_radius=8)
-                btn.draw(self.screen)
+        modal = {"mode": {}, "map": {}, "send": None, "cancel": None}
+        if self.pending_challenge:
+            challenger = self.pending_challenge.get("from", "")
+            mode = MODE_LABELS.get(self.pending_challenge.get("mode"), "Base")
+            map_name = MAP_LABELS.get(self.pending_challenge.get("map_preference"), "Unknown")
+            ox, oy, ow, oh = sw // 2 - 230, sh // 2 - 108, 460, 216
+            popup = pygame.Rect(ox, oy, ow, oh)
+            pygame.draw.rect(self.screen, C["panel"], popup, border_radius=14)
+            pygame.draw.rect(self.screen, C["accent"], popup, 2, border_radius=14)
+            draw_text(self.screen, f"{challenger} challenged you", self.f_md, C["accent"],
+                      (sw // 2, oy + 32), "center")
+            draw_text(self.screen, f"Mode: {mode}", self.f_sm, C["text"], (sw // 2, oy + 78), "center")
+            draw_text(self.screen, f"Preferred map: {map_name}", self.f_sm, C["dim"],
+                      (sw // 2, oy + 106), "center")
+            acc_btn = Button((sw // 2 - 130, oy + 146, 115, 42), "Accept", self.f_sm,
+                             C["btn_green"], (50, 180, 70))
+            dec_btn = Button((sw // 2 + 15, oy + 146, 115, 42), "Decline", self.f_sm,
+                             C["btn_red"], (200, 50, 50))
+            acc_btn.draw(self.screen); dec_btn.draw(self.screen)
 
-        # Error / info bar
+        if self.challenge_setup:
+            setup = self.challenge_setup
+            ox, oy, ow, oh = sw // 2 - 270, sh // 2 - 215, 540, 430
+            popup = pygame.Rect(ox, oy, ow, oh)
+            pygame.draw.rect(self.screen, C["panel"], popup, border_radius=16)
+            pygame.draw.rect(self.screen, C["accent"], popup, 2, border_radius=16)
+            draw_text(self.screen, "Prepare Challenge", self.f_lg, C["accent"], (sw // 2, oy + 28), "center")
+            draw_text(self.screen, f"Opponent: {setup['target']}", self.f_sm, C["text"], (ox + 30, oy + 82))
+            draw_text(self.screen, "Mode", self.f_sm, C["dim"], (ox + 30, oy + 120))
+            for idx, mode in enumerate(MODE_ORDER):
+                rect = pygame.Rect(ox + 30, oy + 152 + idx * 42, 224, 34)
+                modal["mode"][mode] = rect
+                chosen = setup["mode"] == mode
+                pygame.draw.rect(self.screen, C["card_hi"] if chosen else C["card"], rect, border_radius=8)
+                pygame.draw.rect(self.screen, C["accent"] if chosen else C["card_border"],
+                                 rect, 2 if chosen else 1, border_radius=8)
+                draw_text(self.screen, MODE_LABELS[mode], self.f_xs,
+                          C["white"] if chosen else C["text"], (rect.x + 10, rect.y + 9))
+            draw_text(self.screen, MODE_BLURBS.get(setup["mode"], ""), self.f_xs, C["dim"],
+                      (ox + 30, oy + 342))
+            draw_text(self.screen, "Map preference", self.f_sm, C["dim"], (ox + 290, oy + 120))
+            for idx, map_id in enumerate(MAP_ORDER):
+                rect = pygame.Rect(ox + 290, oy + 152 + idx * 62, 220, 50)
+                modal["map"][map_id] = rect
+                chosen = setup["map_preference"] == map_id
+                theme = MAP_THEMES[map_id]
+                pygame.draw.rect(self.screen, theme["board_bg"], rect, border_radius=10)
+                pygame.draw.rect(self.screen, theme["accent"] if chosen else C["card_border"],
+                                 rect, 2 if chosen else 1, border_radius=10)
+                draw_text(self.screen, MAP_LABELS[map_id], self.f_sm, C["text"], (rect.x + 16, rect.y + 8))
+                draw_text(self.screen, "Distinct obstacle layout", self.f_xs, C["dim"], (rect.x + 16, rect.y + 28))
+            modal["send"] = Button((sw // 2 - 128, oy + 372, 118, 42), "Send", self.f_sm,
+                                    C["btn_green"], (50, 180, 70))
+            modal["cancel"] = Button((sw // 2 + 12, oy + 372, 118, 42), "Cancel", self.f_sm,
+                                      C["btn_red"], (200, 50, 50))
+            modal["send"].draw(self.screen); modal["cancel"].draw(self.screen)
+
         if self.error_msg:
-            draw_text(self.screen, self.error_msg, self.f_xs, C["danger"],
-                      (24, sh - 215))
+            draw_text(self.screen, self.error_msg, self.f_xs, C["danger"], (24, sh - 215))
+        return btn_rects, watch_btns, acc_btn, dec_btn, modal
 
-        return btn_rects, watch_btns, acc_btn, dec_btn
-
-    # ── Customization screen ──────────────────
     def _draw_customize(self):
         sw, sh = self.screen.get_size()
-        # Gradient background
-        for y in range(sh):
-            alpha = 0.4 + 0.6 * (y / sh)
-            color = (int(15 * alpha), int(18 * alpha), int(25 * alpha))
-            pygame.draw.line(self.screen, color, (0, y), (sw, y))
+        theme = self._theme()
+        self.screen.fill(theme["board_bg"])
+        draw_text(self.screen,
+                  "Customize Your Snake" if self.round_number <= 1 else f"Round {self.round_number} Ready Up",
+                  self.f_lg, theme.get("accent", C["accent"]), (sw // 2, 42), "center")
+        draw_text(self.screen, f"vs  {self.opponent}", self.f_sm, C["dim"], (sw // 2, 92), "center")
+        draw_text(self.screen,
+                  f"Mode: {MODE_LABELS.get(self.selected_mode, 'Base')} | First to {self.target_wins}",
+                  self.f_xs, C["text"], (sw // 2, 122), "center")
+        if self.round_wins:
+            draw_text(self.screen,
+                      f"Score {self.username} {self.round_wins.get(self.username, 0)} - "
+                      f"{self.round_wins.get(self.opponent, 0)} {self.opponent}",
+                      self.f_sm, C["text"], (sw // 2, 146), "center")
 
-        draw_text(self.screen, "Customize Your Snake", self.f_lg, C["accent"],
-                  (sw // 2, 45), "center")
-        draw_text(self.screen, f"vs  {self.opponent}", self.f_sm, C["dim"],
-                  (sw // 2, 100), "center")
+        map_rects = {}
+        draw_text(self.screen, "Selected Map", self.f_sm, C["dim"], (sw // 2, 178), "center")
+        total_w = 3 * 176 + 2 * 18
+        start_x = sw // 2 - total_w // 2
+        for idx, map_id in enumerate(MAP_ORDER):
+            rect = pygame.Rect(start_x + idx * 194, 196, 176, 70)
+            theme2 = MAP_THEMES[map_id]
+            chosen = (self.selected_map or self.map_vote) == map_id
+            pygame.draw.rect(self.screen, theme2["board_bg"], rect, border_radius=12)
+            pygame.draw.rect(self.screen, theme2["accent"] if chosen else C["card_border"],
+                             rect, 2 if chosen else 1, border_radius=12)
+            draw_text(self.screen, MAP_LABELS[map_id], self.f_sm, C["text"], (rect.x + 16, rect.y + 10))
+            label = "Challenger choice" if chosen else "Unavailable"
+            draw_text(self.screen, label, self.f_xs, theme2["accent"] if chosen else C["dim"],
+                      (rect.x + 16, rect.y + 38))
+        draw_text(self.screen,
+                  f"Map was selected by challenger: {MAP_LABELS.get(self.selected_map or self.map_vote, 'Ember Forge')}",
+                  self.f_xs, theme.get("accent", C["accent"]), (sw // 2, 278), "center")
 
-        pygame.draw.line(self.screen, C["card_border"], (30, 128), (sw - 30, 128), 1)
-        pygame.draw.line(self.screen, C["card_border"], (sw // 2, 128), (sw // 2, sh - 85), 1)
+        pygame.draw.line(self.screen, C["card_border"], (30, 308), (sw - 30, 308), 1)
+        pygame.draw.line(self.screen, C["card_border"], (sw // 2, 308), (sw // 2, sh - 90), 1)
 
-        # ── Left panel: color picker ─────────────────
         lx = 50
-        draw_text(self.screen, "Snake Color", self.f_md, C["text"], (lx, 145))
-
-        # Mini snake preview with shadow
+        draw_text(self.screen, "Snake Color", self.f_md, C["text"], (lx, 326))
         prev_color = tuple(self.custom_color)
-        prev_head  = tuple(min(255, v + 60) for v in self.custom_color)
+        prev_head = tuple(min(255, v + 60) for v in self.custom_color)
         for i in range(5):
-            r = pygame.Rect(lx + i * 34, 190, 30, 30)
-            # Shadow
-            shadow_r = r.copy()
-            shadow_r.x += 2
-            shadow_r.y += 2
-            pygame.draw.rect(self.screen, (0, 0, 0, 50), shadow_r, border_radius=5 if i == 0 else 3)
-            c = prev_head if i == 0 else prev_color
-            pygame.draw.rect(self.screen, c, r, border_radius=5 if i == 0 else 3)
+            r = pygame.Rect(lx + i * 34, 372, 30, 30)
+            pygame.draw.rect(self.screen, prev_head if i == 0 else prev_color, r, border_radius=5 if i == 0 else 3)
             if i == 0:
-                pygame.draw.circle(self.screen, C["black"], (r.x + 9,  r.y + 9),  3)
-                pygame.draw.circle(self.screen, C["black"], (r.x + 20, r.y + 9),  3)
-                pygame.draw.circle(self.screen, C["white"], (r.x + 10, r.y + 8),  1)
-                pygame.draw.circle(self.screen, C["white"], (r.x + 21, r.y + 8),  1)
-
-        # Color swatches — 2 rows of 6 with shadows
+                pygame.draw.circle(self.screen, C["black"], (r.x + 9, r.y + 9), 3)
+                pygame.draw.circle(self.screen, C["black"], (r.x + 20, r.y + 9), 3)
         swatch_rects = {}
         for idx, color in enumerate(SNAKE_COLORS):
             row, col_i = divmod(idx, 6)
-            sx = lx + col_i * 58
-            sy = 242 + row * 62
-            rect = pygame.Rect(sx, sy, 50, 50)
+            rect = pygame.Rect(lx + col_i * 58, 424 + row * 62, 50, 50)
             swatch_rects[idx] = rect
-            # Shadow
-            srect = rect.copy()
-            srect.x += 2
-            srect.y += 2
-            pygame.draw.rect(self.screen, (0, 0, 0, 50), srect, border_radius=8)
             pygame.draw.rect(self.screen, tuple(color), rect, border_radius=8)
-            border = C["white"] if list(color) == self.custom_color else C["card_border"]
-            bw     = 3         if list(color) == self.custom_color else 1
-            pygame.draw.rect(self.screen, border, rect, bw, border_radius=8)
+            pygame.draw.rect(self.screen, C["white"] if list(color) == self.custom_color else C["card_border"],
+                             rect, 3 if list(color) == self.custom_color else 1, border_radius=8)
 
-        # ── Right panel: key bindings ─────────────────
         rx = sw // 2 + 24
-        draw_text(self.screen, "Movement Keys", self.f_md, C["text"], (rx, 145))
-
-        dir_to_key   = {v: k for k, v in self.key_map.items()}
+        draw_text(self.screen, "Movement Keys", self.f_md, C["text"], (rx, 326))
+        dir_to_key = {v: k for k, v in self.key_map.items()}
         key_slot_rects = {}
         for i, (direction, symbol) in enumerate(DIR_SYMBOLS.items()):
-            ry = 182 + i * 72
+            ry = 362 + i * 72
             row_r = pygame.Rect(rx, ry, 366, 58)
-            # Shadow
-            row_shadow = row_r.copy()
-            row_shadow.x += 2
-            row_shadow.y += 2
-            pygame.draw.rect(self.screen, (0, 0, 0, 50), row_shadow, border_radius=8)
             pygame.draw.rect(self.screen, C["card"], row_r, border_radius=8)
-
-            draw_text(self.screen, symbol,    self.f_lg, C["text"],   (rx + 18, ry + 10))
-            draw_text(self.screen, direction, self.f_sm, C["dim"],    (rx + 52, ry + 17))
-
+            draw_text(self.screen, symbol, self.f_lg, C["text"], (rx + 18, ry + 10))
+            draw_text(self.screen, direction, self.f_sm, C["dim"], (rx + 52, ry + 17))
             kcode = dir_to_key.get(direction)
             kname = pygame.key.name(kcode).upper() if kcode else "-"
-            is_binding = (self.binding_slot == direction)
-
+            is_binding = self.binding_slot == direction
             kbox = pygame.Rect(rx + 238, ry + 11, 110, 36)
             key_slot_rects[direction] = kbox
-            kbg  = C["btn_hover"] if is_binding else (
-                   C["btn"] if kbox.collidepoint(pygame.mouse.get_pos()) else C["input_bg"])
-            # Key box shadow
-            kshadow = kbox.copy()
-            kshadow.x += 1
-            kshadow.y += 1
-            pygame.draw.rect(self.screen, (0, 0, 0, 40), kshadow, border_radius=6)
-            pygame.draw.rect(self.screen, kbg, kbox, border_radius=6)
-            pygame.draw.rect(self.screen,
-                             C["accent"] if is_binding else C["card_border"],
-                             kbox, 2, border_radius=6)
-            draw_text(self.screen,
-                      "Press key..." if is_binding else kname,
-                      self.f_sm,
-                      C["accent"] if is_binding else C["text"],
-                      kbox.center, "center")
+            pygame.draw.rect(self.screen, C["btn_hover"] if is_binding else C["input_bg"], kbox, border_radius=6)
+            pygame.draw.rect(self.screen, C["accent"] if is_binding else C["card_border"], kbox, 2, border_radius=6)
+            draw_text(self.screen, "Press key..." if is_binding else kname, self.f_sm,
+                      C["accent"] if is_binding else C["text"], kbox.center, "center")
 
-        # ── Ready / waiting ───────────────────────────
-        ready_r = pygame.Rect(sw // 2 - 120, sh - 78, 240, 52)
+        ready_names = [name for name, ready in self.ready_state.items() if ready]
+        draw_text(self.screen, "Ready: " + (", ".join(ready_names) if ready_names else "nobody yet"),
+                  self.f_xs, C["dim"], (sw // 2, sh - 118), "center")
+        ready_r = pygame.Rect(sw // 2 - 120, sh - 76, 240, 50)
         if self.customize_ready:
             draw_text(self.screen, "Waiting for opponent...", self.f_sm, C["dim"],
-                      (sw // 2, sh - 52), "center")
+                      (sw // 2, sh - 50), "center")
         else:
-            hov = ready_r.collidepoint(pygame.mouse.get_pos())
-            # Button shadow
-            ready_shadow = ready_r.copy()
-            ready_shadow.x += 3
-            ready_shadow.y += 3
-            pygame.draw.rect(self.screen, (0, 0, 0, 60), ready_shadow, border_radius=10)
-            pygame.draw.rect(self.screen,
-                             C["btn_hover"] if hov else C["btn_green"],
-                             ready_r, border_radius=10)
-            draw_text(self.screen, "Ready", self.f_md, C["text"],
-                      ready_r.center, "center")
+            pygame.draw.rect(self.screen, C["btn_green"], ready_r, border_radius=10)
+            draw_text(self.screen, "Ready", self.f_md, C["text"], ready_r.center, "center")
+        countdown = self._countdown_value()
+        if countdown:
+            overlay = pygame.Surface((sw, sh), pygame.SRCALPHA); overlay.fill((0, 0, 0, 110))
+            self.screen.blit(overlay, (0, 0))
+            draw_text(self.screen, str(countdown), self.f_xl, C["white"], (sw // 2, sh // 2 - 10), "center")
+            draw_text(self.screen, "Match starting", self.f_sm, C["accent"], (sw // 2, sh // 2 + 42), "center")
+        return swatch_rects, key_slot_rects, ready_r, map_rects
 
-        return swatch_rects, key_slot_rects, ready_r
-
-    # ── Game / Watching screen ────────────────
     def _draw_game(self):
         gw, gh = self.gw, self.gh
         game_w, game_h = gw * CELL, gh * CELL
@@ -1128,202 +1310,185 @@ class ArenaClient:
         board_y = (screen_h - game_h) // 2
         self._board_x = board_x
         self._board_y = board_y
+        theme = self._theme()
         self.screen.fill(C["bg"])
-
-        # Grid lines
+        pygame.draw.rect(self.screen, theme["board_bg"], (board_x, board_y, game_w, game_h))
         for x in range(0, game_w + 1, CELL):
-            pygame.draw.line(self.screen, C["grid"],
-                             (board_x + x, board_y),
-                             (board_x + x, board_y + game_h))
+            pygame.draw.line(self.screen, theme["grid"], (board_x + x, board_y), (board_x + x, board_y + game_h))
         for y in range(0, game_h + 1, CELL):
-            pygame.draw.line(self.screen, C["grid"],
-                             (board_x, board_y + y),
-                             (board_x + game_w, board_y + y))
-
+            pygame.draw.line(self.screen, theme["grid"], (board_x, board_y + y), (board_x + game_w, board_y + y))
         if not self.game_state:
-            draw_text(self.screen, "Waiting for first game state...",
-                      self.f_md, C["dim"],
+            draw_text(self.screen, "Waiting for first game state...", self.f_md, C["dim"],
                       (board_x + game_w // 2, board_y + game_h // 2), "center")
             self._draw_panel(board_x + game_w, board_y, game_h)
             return
 
         gs = self.game_state
         effects = gs.get("effects", {})
-
-        # Obstacles
+        if gs.get("map_id"):
+            self.selected_map = gs.get("map_id")
+            theme = self._theme()
+        safe_zone = gs.get("safe_zone")
+        if safe_zone:
+            sx, sy, zw, zh = safe_zone
+            pygame.draw.rect(self.screen, theme["safe_zone"],
+                             (board_x + sx * CELL, board_y + sy * CELL, zw * CELL, zh * CELL), 3, border_radius=4)
         for ox, oy in gs.get("obstacles", []):
-            r = pygame.Rect(board_x + ox * CELL + 1, board_y + oy * CELL + 1,
-                            CELL - 2, CELL - 2)
-            pygame.draw.rect(self.screen, C["obstacle"], r, border_radius=2)
-            pygame.draw.line(self.screen, C["obstacle_x"],
-                             r.topleft, r.bottomright, 1)
-            pygame.draw.line(self.screen, C["obstacle_x"],
-                             r.topright, r.bottomleft, 1)
-
-        # Pies
+            r = pygame.Rect(board_x + ox * CELL + 1, board_y + oy * CELL + 1, CELL - 2, CELL - 2)
+            pygame.draw.rect(self.screen, theme["obstacle"], r, border_radius=2)
+            pygame.draw.line(self.screen, theme["obstacle_x"], r.topleft, r.bottomright, 1)
+            pygame.draw.line(self.screen, theme["obstacle_x"], r.topright, r.bottomleft, 1)
         for pie in gs.get("pies", []):
             px, py = pie["pos"]
-            color  = tuple(pie.get("color", C["pie_normal"]))
-            cx_    = board_x + px * CELL + CELL // 2
-            cy_    = board_y + py * CELL + CELL // 2
-            r      = CELL // 2 - 2
+            center = (board_x + px * CELL + CELL // 2, board_y + py * CELL + CELL // 2)
+            r = CELL // 2 - 2
             if pie.get("kind") == "poison":
-                self._draw_poison_skull((cx_, cy_), r)
+                self._draw_poison_skull(center, r)
             else:
-                pulse_r = r + (1 if pie.get("kind") == "golden" else 0)
-                pygame.draw.circle(self.screen, color, (cx_, cy_), pulse_r)
-                pygame.draw.circle(self.screen, C["white"], (cx_, cy_), pulse_r, 1)
-                if pie.get("kind") == "golden":
-                    pygame.draw.circle(self.screen, (255, 245, 180), (cx_ - 3, cy_ - 3), max(2, r // 3))
-
-        # Power-ups
+                color = tuple(pie.get("color", C["pie_normal"]))
+                pygame.draw.circle(self.screen, color, center, r + (1 if pie.get("kind") == "golden" else 0))
+                pygame.draw.circle(self.screen, C["white"], center, r, 1)
         for pu in gs.get("powerups", []):
-            px_, py_ = pu["pos"]
-            color    = tuple(pu.get("color", C["card_border"]))
-            cx_      = board_x + px_ * CELL + CELL // 2
-            cy_      = board_y + py_ * CELL + CELL // 2
-            r        = CELL // 2 - 2
+            px, py = pu["pos"]
+            center = (board_x + px * CELL + CELL // 2, board_y + py * CELL + CELL // 2)
+            color = tuple(pu.get("color", C["card_border"]))
+            r = CELL // 2 - 2
             if pu.get("kind") == "shield":
-                self._draw_shield_pickup((cx_, cy_), r, color)
+                self._draw_shield_pickup(center, r, color)
             elif pu.get("kind") == "freeze":
-                self._draw_freeze_pickup((cx_, cy_), r, color)
+                self._draw_freeze_pickup(center, r, color)
             else:
-                pts = [(cx_, cy_ - r), (cx_ + r, cy_),
-                       (cx_, cy_ + r), (cx_ - r, cy_)]
+                pts = [(center[0], center[1] - r), (center[0] + r, center[1]),
+                       (center[0], center[1] + r), (center[0] - r, center[1])]
                 pygame.draw.polygon(self.screen, color, pts)
                 pygame.draw.polygon(self.screen, C["white"], pts, 1)
-                pygame.draw.circle(self.screen, (255, 245, 180), (cx_, cy_), max(2, r // 3))
-
-        # Snakes
         for pid_s, snake in gs.get("snakes", {}).items():
-            raw    = snake.get("color", [200, 200, 200])
+            raw = snake.get("color", [200, 200, 200])
             body_c = tuple(raw)
             head_c = tuple(min(255, v + 40) for v in raw)
             if not snake.get("alive", True):
                 body_c = head_c = tuple(max(0, v - 100) for v in raw)
-
             for i, (bx, by) in enumerate(snake.get("body", [])):
-                rect = pygame.Rect(board_x + bx * CELL + 1, board_y + by * CELL + 1,
-                                   CELL - 2, CELL - 2)
-                if not snake.get("alive", True):
-                    pygame.draw.rect(self.screen, body_c, rect, border_radius=1)
-                elif i == 0:
+                rect = pygame.Rect(board_x + bx * CELL + 1, board_y + by * CELL + 1, CELL - 2, CELL - 2)
+                if i == 0 and snake.get("alive", True):
                     pygame.draw.rect(self.screen, head_c, rect, border_radius=3)
-                    ex, ey = rect.centerx, rect.centery
-                    pygame.draw.circle(self.screen, C["black"], (ex-2, ey-2), 2)
-                    pygame.draw.circle(self.screen, C["black"], (ex+2, ey-2), 2)
+                    pygame.draw.circle(self.screen, C["black"], (rect.centerx - 2, rect.centery - 2), 2)
+                    pygame.draw.circle(self.screen, C["black"], (rect.centerx + 2, rect.centery - 2), 2)
                 else:
                     pygame.draw.rect(self.screen, body_c, rect, border_radius=2)
-
             snake_effects = effects.get(pid_s, [])
             if "shield" in snake_effects:
                 self._draw_shield_ring(snake)
             if "freeze" in snake_effects:
                 self._draw_freeze_overlay(snake)
-
         self._draw_board_animations()
+        self._draw_fog_of_war(gs, board_x, board_y)
         self._draw_panel(board_x + game_w, board_y, game_h)
+        countdown = self._countdown_value()
+        if countdown:
+            sw, sh = self.screen.get_size()
+            overlay = pygame.Surface((sw, sh), pygame.SRCALPHA); overlay.fill((0, 0, 0, 120))
+            self.screen.blit(overlay, (0, 0))
+            draw_text(self.screen, str(countdown), self.f_xl, C["white"],
+                      (board_x + game_w // 2, board_y + game_h // 2 - 10), "center")
+            draw_text(self.screen, "Round starting", self.f_sm, C["accent"],
+                      (board_x + game_w // 2, board_y + game_h // 2 + 42), "center")
 
     def _draw_panel(self, panel_x, panel_y, game_h):
         px = panel_x
-        pygame.draw.rect(self.screen, C["panel"],
-                         (px, panel_y, PANEL_W, game_h))
-        pygame.draw.line(self.screen, C["card_border"],
-                         (px, panel_y), (px, panel_y + game_h), 2)
-
-        gs        = self.game_state or {}
-        snakes    = gs.get("snakes", {})
+        pygame.draw.rect(self.screen, C["panel"], (px, panel_y, PANEL_W, game_h))
+        pygame.draw.line(self.screen, C["card_border"], (px, panel_y), (px, panel_y + game_h), 2)
+        gs = self.game_state or {}
+        snakes = gs.get("snakes", {})
         usernames = gs.get("usernames", {})
         time_left = gs.get("time_left", 0)
-
-        EFF_COLOR = {"shield": (180, 180, 220), "freeze": (0, 210, 240),
-                     "double": (255, 200, 50)}
-        EFF_LABEL = {"shield": "Shield", "freeze": "Frozen!",
-                     "double": "2x Pies"}
+        theme = self._theme()
+        effects = gs.get("effects", {})
+        eff_color = {"shield": (180, 180, 220), "freeze": (0, 210, 240), "double": (255, 200, 50)}
+        eff_label = {"shield": "Shield", "freeze": "Frozen!", "double": "2x Pies"}
 
         y = panel_y + 14
-        # Player health panels
-        effects = gs.get("effects", {})
+        draw_text(self.screen,
+                  f"{MODE_LABELS.get(self.selected_mode, 'Base')} - {MAP_LABELS.get(self.selected_map, 'Map voting')}",
+                  self.f_xs, theme.get("accent", C["accent"]), (px + 10, y))
+        y += 18
+        if self.target_wins > 1:
+            p1 = usernames.get("1", "P1")
+            p2 = usernames.get("2", "P2")
+            draw_text(self.screen,
+                      f"Round {self.round_number} | {p1} {self.round_wins.get(p1, 0)} - {self.round_wins.get(p2, 0)} {p2}",
+                      self.f_xs, C["dim"], (px + 10, y))
+            y += 18
+
         for pid_s in ("1", "2"):
-            snake  = snakes.get(pid_s, {})
-            raw    = snake.get("color", [200, 200, 200])
+            snake = snakes.get(pid_s, {})
+            raw = snake.get("color", [200, 200, 200])
             body_c = tuple(raw)
-            uname  = usernames.get(pid_s, f"Player {pid_s}")
-            hp     = snake.get("health", 0)
-            alive  = snake.get("alive", True)
-            me     = (int(pid_s) == self.player_id)
-
+            uname = usernames.get(pid_s, f"Player {pid_s}")
+            hp = snake.get("health", 0)
+            alive = snake.get("alive", True)
+            me = (self.player_id is not None and int(pid_s) == self.player_id)
             label = f"{'> ' if me else ''}{uname}{'  (you)' if me else ''}"
-            col   = body_c if alive else C["dim"]
-            draw_text(self.screen, label, self.f_sm, col, (px + 10, y))
+            draw_text(self.screen, label, self.f_sm, body_c if alive else C["dim"], (px + 10, y))
             y += 24
-
-            # HP bar
             bar = pygame.Rect(px + 10, y, PANEL_W - 22, 16)
             pygame.draw.rect(self.screen, C["input_bg"], bar, border_radius=5)
             w = int(bar.w * max(0, hp) / 200)
             if w > 0:
-                bc = body_c if hp > 40 else C["hp_low"]
-                pygame.draw.rect(self.screen, bc,
-                                 pygame.Rect(bar.x, bar.y, w, bar.h),
-                                 border_radius=5)
+                pygame.draw.rect(self.screen, body_c if hp > 40 else C["hp_low"],
+                                 pygame.Rect(bar.x, bar.y, w, bar.h), border_radius=5)
             pygame.draw.rect(self.screen, C["card_border"], bar, 1, border_radius=5)
-            draw_text(self.screen, f"HP {hp}", self.f_xs, C["text"],
-                      (bar.x + 5, bar.y + 2))
+            draw_text(self.screen, f"HP {hp}", self.f_xs, C["text"], (bar.x + 5, bar.y + 2))
             y += 20
-
-            # Active effects badges
             for eff in effects.get(pid_s, []):
-                draw_text(self.screen, EFF_LABEL.get(eff, eff),
-                          self.f_xs, EFF_COLOR.get(eff, C["dim"]), (px + 12, y))
+                draw_text(self.screen, eff_label.get(eff, eff), self.f_xs,
+                          eff_color.get(eff, C["dim"]), (px + 12, y))
                 y += 13
             y += 8
 
         y += 4
-        # Timer
         tc = C["danger"] if time_left < 20 else C["accent"]
-        pygame.draw.rect(self.screen, C["card"],
-                         (px + 10, y, PANEL_W - 22, 34), border_radius=7)
-        draw_text(self.screen, f"Time: {int(time_left)} s remaining",
-                  self.f_sm, tc, (px + PANEL_W//2, y + 10), "center")
+        pygame.draw.rect(self.screen, C["card"], (px + 10, y, PANEL_W - 22, 34), border_radius=7)
+        draw_text(self.screen, f"Time: {int(time_left)} s remaining", self.f_sm, tc,
+                  (px + PANEL_W // 2, y + 10), "center")
         y += 46
 
-        # Legend
         draw_text(self.screen, "Legend", self.f_xs, C["dim"], (px + 10, y))
         y += 18
         legend = [
-            (C["pie_normal"],  "Normal Pie   +15 HP"),
-            (C["pie_golden"],  "Golden Pie   +30 HP"),
-            (C["pie_poison"],  "Poison Pie   -20 HP"),
-            (C["obstacle"],    "Obstacle     -25 HP"),
-            ((180, 180, 220),  "Shield       next hit"),
-            ((  0, 210, 240),  "Freeze       opp. 5s"),
-            ((255, 200,  50),  "2x Pies      5s buff"),
+            (C["pie_normal"], "Normal Pie   +15 HP"),
+            (C["pie_golden"], "Golden Pie   +30 HP"),
+            (C["pie_poison"], "Poison Pie   -20 HP"),
+            (theme["obstacle"], "Obstacle     -25 HP"),
         ]
+        if self.selected_mode == "sudden_death":
+            legend.append((theme["safe_zone"], "Safe Zone    shrinking"))
+        else:
+            legend.extend([
+                ((180, 180, 220), "Shield       next hit"),
+                ((0, 210, 240), "Freeze       opp. 5s"),
+                ((255, 200, 50), "2x Pies      5s buff"),
+            ])
         for color, label in legend:
-            pygame.draw.rect(self.screen, color,
-                             (px + 10, y + 2, 13, 13), border_radius=3)
+            pygame.draw.rect(self.screen, color, (px + 10, y + 2, 13, 13), border_radius=3)
             draw_text(self.screen, label, self.f_xs, C["dim"], (px + 28, y))
             y += 18
 
         y += 8
-        # Controls hint (only if playing, not watching)
-        if self.state == "GAME":
-            hint_lines = ["Arrow keys / WASD: move", "T + Enter: chat"]
-        else:
-            hint_lines = ["Watching...", "T + Enter: cheer"]
-        for hl in hint_lines:
-            draw_text(self.screen, hl, self.f_xs, C["dim"], (px + 10, y))
+        hint_lines = ["Arrow keys / WASD: move", "T + Enter: chat"] if self.state == "GAME" else ["Watching...", "T + Enter: cheer"]
+        for line in hint_lines:
+            draw_text(self.screen, line, self.f_xs, C["dim"], (px + 10, y))
             y += 16
 
-        # Chat area
-        chat_top = max(y + 10, panel_y + game_h - CHAT_LINES * 17 - 50)
+        chat_top = max(y + 10, panel_y + game_h - 185)
         draw_text(self.screen, "Chat", self.f_xs, C["dim"], (px + 10, chat_top))
-        for j, line in enumerate(self.chat_log[-CHAT_LINES:]):
-            draw_text(self.screen, line[:34], self.f_xs, C["text"],
-                      (px + 6, chat_top + 18 + j * 17))
+        for j, line in enumerate(self.chat_log[-4:]):
+            draw_text(self.screen, line[:34], self.f_xs, C["text"], (px + 6, chat_top + 18 + j * 17))
+        event_top = chat_top + 92
+        draw_text(self.screen, "Event Log", self.f_xs, C["dim"], (px + 10, event_top))
+        for j, line in enumerate(gs.get("event_log", [])[-3:]):
+            draw_text(self.screen, line[:36], self.f_xs, C["accent"], (px + 6, event_top + 18 + j * 16))
 
-        # Chat input box at bottom of panel
         ci = pygame.Rect(px + 5, panel_y + game_h - 34, PANEL_W - 10, 28)
         if not hasattr(self, "_game_chat_input"):
             self._game_chat_input = TextInput(ci, "T to chat...", self.f_xs, max_len=60)
@@ -1331,74 +1496,51 @@ class ArenaClient:
         self._game_chat_input.draw(self.screen)
 
     def _draw_game_over(self):
-        self._draw_game()   # render last game state behind
-
+        self._draw_game()
         sw, sh = self.screen.get_size()
-        # Overlay with gradient
-        ov = pygame.Surface((sw, sh), pygame.SRCALPHA)
-        for y in range(sh):
-            alpha = 0.4 + 0.6 * (y / sh)
-            color = (0, 0, 0, int(160 * alpha))
-            pygame.draw.line(ov, color, (0, y), (sw, y))
-        self.screen.blit(ov, (0, 0))
-
+        overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 170))
+        self.screen.blit(overlay, (0, 0))
         pd = self.game_over_data or {}
         winner = pd.get("winner", "?")
         scores = pd.get("scores", {})
-
-        pw, ph = 480, 300
-        pr = pygame.Rect(sw//2 - pw//2, sh//2 - ph//2, pw, ph)
-        # Shadow
-        pr_shadow = pr.copy()
-        pr_shadow.x += 4
-        pr_shadow.y += 4
-        pygame.draw.rect(self.screen, (0, 0, 0, 80), pr_shadow, border_radius=16)
+        round_wins = pd.get("round_wins", {})
+        target_wins = pd.get("target_wins", self.target_wins)
+        pw, ph = 500, 310
+        pr = pygame.Rect(sw // 2 - pw // 2, sh // 2 - ph // 2, pw, ph)
         pygame.draw.rect(self.screen, C["panel"], pr, border_radius=16)
-        pygame.draw.rect(self.screen, C["accent"], pr, 3,  border_radius=16)
-
-        draw_text(self.screen, "GAME OVER", self.f_xl, C["accent"],
-                  (sw//2, pr.y + 30), "center")
-
+        pygame.draw.rect(self.screen, C["accent"], pr, 3, border_radius=16)
+        draw_text(self.screen, "GAME OVER", self.f_xl, C["accent"], (sw // 2, pr.y + 30), "center")
         if winner == "TIE":
-            rtxt, rcol = "It's a Tie!", C["text"]
+            result, color = "It's a Tie!", C["text"]
         elif winner == self.username:
-            rtxt, rcol = "You Win!", C["win"]
+            result, color = "You Win!", C["win"]
         else:
-            rtxt, rcol = f"{winner} Wins!", C["lose"]
-
-        draw_text(self.screen, rtxt, self.f_lg, rcol,
-                  (sw//2, pr.y + 100), "center")
-
+            result, color = f"{winner} Wins!", C["lose"]
+        draw_text(self.screen, result, self.f_lg, color, (sw // 2, pr.y + 100), "center")
         y = pr.y + 150
-        for uname, hp in scores.items():
-            draw_text(self.screen, f"{uname}:  {hp} HP", self.f_md, C["text"],
-                      (sw//2, y), "center")
-            y += 36
-
-        back_btn = Button((sw//2 - 115, pr.bottom - 62, 230, 46),
-                          "Back to Lobby", self.f_md)
-        # Button shadow
-        bshadow = back_btn.rect.copy()
-        bshadow.x += 2
-        bshadow.y += 2
-        pygame.draw.rect(self.screen, (0, 0, 0, 50), bshadow, border_radius=8)
+        if round_wins and target_wins > 1:
+            for uname, wins in round_wins.items():
+                draw_text(self.screen, f"{uname}: {wins} round wins", self.f_md, C["text"], (sw // 2, y), "center")
+                y += 34
+        else:
+            for uname, hp in scores.items():
+                draw_text(self.screen, f"{uname}: {hp} HP", self.f_md, C["text"], (sw // 2, y), "center")
+                y += 34
+        back_btn = Button((sw // 2 - 115, pr.bottom - 62, 230, 46), "Back to Lobby", self.f_md)
         back_btn.draw(self.screen)
         return back_btn
 
-    # ──────────────────────────────────────────
-    #  MAIN LOOP
-    # ──────────────────────────────────────────
     def run(self):
-        # Per-screen persistent state
-        lobby_btn_rects  = {}
-        watch_btns       = {}    # game_id -> Rect
+        lobby_btn_rects = {}
+        watch_btns = {}
+        challenge_modal = {"mode": {}, "map": {}, "send": None, "cancel": None}
         acc_btn = dec_btn = None
-        back_btn          = None
-
-        # Customize screen rects (refreshed each frame)
-        cust_swatch_rects  = {}   # idx -> Rect
-        cust_key_rects     = {}   # direction -> Rect
-        cust_ready_r       = None
+        back_btn = None
+        cust_swatch_rects = {}
+        cust_key_rects = {}
+        cust_ready_r = None
+        cust_map_rects = {}
 
         while True:
             self.clock.tick(60)
@@ -1408,21 +1550,18 @@ class ArenaClient:
                 if self.error_timer == 0:
                     self.error_msg = ""
 
-            events = pygame.event.get()
-            for event in events:
+            for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     self._close_connection()
                     pygame.quit()
                     sys.exit()
 
-                # ── CONNECT ───────────────────
                 if self.state == "CONNECT":
                     ip_entered = self.ip_input.handle(event)
                     port_entered = self.port_input.handle(event)
                     if self.conn_btn.clicked(event) or ip_entered or port_entered:
                         self._try_connect()
 
-                # ── USERNAME ──────────────────
                 elif self.state == "USERNAME":
                     entered = self.name_input.handle(event)
                     if self.join_btn.clicked(event) or entered:
@@ -1430,59 +1569,68 @@ class ArenaClient:
                         if uname:
                             self._send({"type": "username", "username": uname})
 
-                # ── LOBBY ─────────────────────
                 elif self.state == "LOBBY":
                     if not hasattr(self, "_lobby_chat_input"):
-                        self._lobby_chat_input = TextInput(
-                            (0, 0, 100, 30), "", self.f_xs, 80)
-
-                    lci_entered = self._lobby_chat_input.handle(event)
-                    if lci_entered and self._lobby_chat_input.text.strip():
-                        self._send({"type": "lobby_chat",
-                                    "msg": self._lobby_chat_input.text.strip()})
+                        self._lobby_chat_input = TextInput((0, 0, 100, 30), "", self.f_xs, 80)
+                    if self._lobby_chat_input.handle(event) and self._lobby_chat_input.text.strip():
+                        self._send({"type": "lobby_chat", "msg": self._lobby_chat_input.text.strip()})
                         self._lobby_chat_input.set_text("")
 
-                    if self.pending_from:
+                    if self.challenge_setup:
+                        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                            self.challenge_setup = None
+                        if event.type == pygame.MOUSEBUTTONDOWN:
+                            send_btn = challenge_modal.get("send")
+                            cancel_btn = challenge_modal.get("cancel")
+                            if send_btn and send_btn.clicked(event):
+                                self.map_vote = self.challenge_setup["map_preference"]
+                                self._send({"type": "challenge", "target": self.challenge_setup["target"],
+                                            "mode": self.challenge_setup["mode"],
+                                            "map_preference": self.challenge_setup["map_preference"]})
+                            elif cancel_btn and cancel_btn.clicked(event):
+                                self.challenge_setup = None
+                            else:
+                                for mode, rect in challenge_modal.get("mode", {}).items():
+                                    if rect.collidepoint(event.pos):
+                                        self.challenge_setup["mode"] = mode
+                                for map_id, rect in challenge_modal.get("map", {}).items():
+                                    if rect.collidepoint(event.pos):
+                                        self.challenge_setup["map_preference"] = map_id
+                    elif self.pending_challenge:
                         if acc_btn and acc_btn.clicked(event):
                             self._send({"type": "challenge_response",
-                                        "from": self.pending_from, "accepted": True})
-                            self.pending_from = None
+                                        "from": self.pending_challenge.get("from"), "accepted": True})
+                            self.pending_challenge = None
                         elif dec_btn and dec_btn.clicked(event):
                             self._send({"type": "challenge_response",
-                                        "from": self.pending_from, "accepted": False})
-                            self.pending_from = None
+                                        "from": self.pending_challenge.get("from"), "accepted": False})
+                            self.pending_challenge = None
                     else:
-                        # Challenge buttons
-                        for player, rect in lobby_btn_rects.items():
-                            if event.type == pygame.MOUSEBUTTONDOWN and rect.collidepoint(event.pos):
-                                self._send({"type": "challenge", "target": player})
-                        # Per-game watch buttons
                         if event.type == pygame.MOUSEBUTTONDOWN:
-                            for gid, wrect in watch_btns.items():
-                                if wrect.collidepoint(event.pos):
+                            for player, rect in lobby_btn_rects.items():
+                                if rect.collidepoint(event.pos):
+                                    self.challenge_setup = {"target": player, "mode": "base",
+                                                            "map_preference": self.map_vote or "ember"}
+                            for gid, rect in watch_btns.items():
+                                if rect.collidepoint(event.pos):
                                     self._send({"type": "watch", "game_id": gid})
                                     break
 
-                # ── CUSTOMIZE ─────────────────
                 elif self.state == "CUSTOMIZE":
                     if event.type == pygame.MOUSEBUTTONDOWN:
-                        # Color swatch
                         for idx, rect in cust_swatch_rects.items():
-                            if rect.collidepoint(event.pos):
+                            if not self.customize_ready and rect.collidepoint(event.pos):
                                 self.custom_color = list(SNAKE_COLORS[idx])
                                 self.binding_slot = None
-                        # Key slot (only if not already ready)
+                                self._send_customize_choice()
                         if not self.customize_ready:
                             for direction, rect in cust_key_rects.items():
                                 if rect.collidepoint(event.pos):
                                     self.binding_slot = direction
-                        # Ready button
-                        if (not self.customize_ready and cust_ready_r
-                                and cust_ready_r.collidepoint(event.pos)):
-                            self._send({"type": "player_ready",
-                                        "color": self.custom_color})
+                        if not self.customize_ready and cust_ready_r and cust_ready_r.collidepoint(event.pos):
+                            self._send({"type": "player_ready", "color": self.custom_color})
                             self.customize_ready = True
-                            self.binding_slot    = None
+                            self.binding_slot = None
                     elif event.type == pygame.KEYDOWN:
                         if self.binding_slot:
                             if event.key in RESERVED_BIND_KEYS:
@@ -1490,60 +1638,43 @@ class ArenaClient:
                                 self.binding_slot = None
                                 continue
                             direction = self.binding_slot
-                            # Remove any existing mapping for this key or direction
-                            self.key_map = {k: v for k, v in self.key_map.items()
-                                            if k != event.key and v != direction}
+                            self.key_map = {k: v for k, v in self.key_map.items() if k != event.key and v != direction}
                             self.key_map[event.key] = direction
                             self.binding_slot = None
                         elif event.key == pygame.K_ESCAPE:
                             self.binding_slot = None
 
-                # ── GAME / WATCHING ───────────
                 elif self.state in ("GAME", "WATCHING"):
                     if not hasattr(self, "_game_chat_input"):
-                        self._game_chat_input = TextInput(
-                            (0, 0, 100, 30), "", self.f_xs, 60)
-
-                    gci_entered = self._game_chat_input.handle(event)
-                    if gci_entered and self._game_chat_input.text.strip():
-                        self._send({"type": "game_chat",
-                                    "msg": self._game_chat_input.text.strip()})
+                        self._game_chat_input = TextInput((0, 0, 100, 30), "", self.f_xs, 60)
+                    if self._game_chat_input.handle(event) and self._game_chat_input.text.strip():
+                        self._send({"type": "game_chat", "msg": self._game_chat_input.text.strip()})
                         self._game_chat_input.set_text("")
-
-                    # Keyboard movement (only when chat input not focused)
-                    if (self.state == "GAME" and event.type == pygame.KEYDOWN
-                            and not self._game_chat_input.active):
+                    if self.state == "GAME" and event.type == pygame.KEYDOWN and not self._game_chat_input.active:
                         direction = self.key_map.get(event.key)
                         if direction:
                             self._send({"type": "move", "direction": direction})
+                    if event.type == pygame.KEYDOWN and event.key == pygame.K_t and not self._game_chat_input.active:
+                        self._game_chat_input.activate()
 
-                    # 'T' key activates chat
-                    if event.type == pygame.KEYDOWN and event.key == pygame.K_t:
-                        if not self._game_chat_input.active:
-                            self._game_chat_input.activate()
-
-                # ── GAME OVER ─────────────────
                 elif self.state == "GAME_OVER":
                     if back_btn and back_btn.clicked(event):
                         self._enter_lobby()
 
-            # ── DRAW ──────────────────────────
             if self.state == "CONNECT":
                 self._draw_connect()
             elif self.state == "USERNAME":
                 self._draw_username()
             elif self.state == "LOBBY":
-                lobby_btn_rects, watch_btns, acc_btn, dec_btn = self._draw_lobby()
+                lobby_btn_rects, watch_btns, acc_btn, dec_btn, challenge_modal = self._draw_lobby()
             elif self.state == "CUSTOMIZE":
-                cust_swatch_rects, cust_key_rects, cust_ready_r = self._draw_customize()
+                cust_swatch_rects, cust_key_rects, cust_ready_r, cust_map_rects = self._draw_customize()
             elif self.state in ("GAME", "WATCHING"):
                 self._draw_game()
             elif self.state == "GAME_OVER":
                 back_btn = self._draw_game_over()
-
             pygame.display.flip()
 
 
-# ──────────────────────────────────────────────
 if __name__ == "__main__":
     ArenaClient().run()
