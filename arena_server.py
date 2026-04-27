@@ -205,7 +205,7 @@ class GameSession:
         if not text:
             return
         with self.rlock:
-            self.event_log.append(text)s
+            self.event_log.append(text)
             self.event_log = self.event_log[-7:]
 
     def mark_forfeit(self, username, reason):
@@ -261,7 +261,12 @@ class GameSession:
             if username not in self.user_to_pid:
                 return False
             if color:
-                self.colors[username] = [int(clamp(v, 0, 255)) for v in color[:3]]
+                chosen = [int(clamp(v, 0, 255)) for v in color[:3]]
+                self.colors[username] = chosen
+                pid = str(self.user_to_pid[username])
+                snake = self.snakes.get(pid)
+                if snake is not None:
+                    snake["color"] = list(chosen)
                 changed = True
             if ready is not None:
                 self.ready[username] = bool(ready)
